@@ -12,6 +12,12 @@ const MODES = [
   { mode: 'fisher', label: 'Fisher-KPP', rdSteps: 300 },
   { mode: 'gray-scott', label: 'Gray-Scott', rdSteps: 300 },
   { mode: 'wave', label: 'Wave (leapfrog)', waveSteps: 200 },
+  { mode: 'schrodinger', label: 'Schrodinger, free particle',
+    schrodingerSteps: 200, potential: 'free' },
+  { mode: 'schrodinger', label: 'Schrodinger, square well',
+    schrodingerSteps: 200, potential: 'well' },
+  { mode: 'schrodinger', label: 'Schrodinger, harmonic oscillator',
+    schrodingerSteps: 200, potential: 'harmonic' },
 ];
 
 for (const m of MODES) {
@@ -23,6 +29,8 @@ for (const m of MODES) {
       cols: 20,
       rdSteps: m.rdSteps,
       waveSteps: m.waveSteps,
+      schrodingerSteps: m.schrodingerSteps,
+      potential: m.potential,
     });
 
     expect(isError, `status was: ${statusText}`).toBe(false);

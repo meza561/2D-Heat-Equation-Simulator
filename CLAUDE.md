@@ -29,10 +29,10 @@ There is no separate lint step. The C++ test binary isn't structured for filteri
 To invoke the simulator directly instead of through the API:
 ```bash
 ./heat_sim ROWS COLS top bottom left right [mode] [alpha] [F] [row col temp]...
-# mode: fdm (explicit, default) | be (backward Euler) | cn (Crank-Nicolson) | pde (analytical) | fisher | gray-scott | wave
+# mode: fdm (explicit, default) | be (backward Euler) | cn (Crank-Nicolson) | pde (analytical) | fisher | gray-scott | wave | schrodinger
 # optional flags (anywhere in argv): --insulate=tblr   --material=r0,c0,r1,c1,alpha (repeatable)
 ```
-Fisher-KPP/Gray-Scott/wave take their own trailing params instead of boundary temps/sources — see `main.cpp`'s argv parsing for the exact positions.
+Fisher-KPP/Gray-Scott/wave/Schrodinger take their own trailing params instead of boundary temps/sources — see `main.cpp`'s argv parsing for the exact positions.
 
 ## Architecture
 

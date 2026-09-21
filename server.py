@@ -337,7 +337,8 @@ def run_simulation():
         mode = str(data.get('mode', 'fdm'))
         if mode == 'explicit':
             mode = 'fdm'
-        if mode not in ('fdm', 'be', 'cn', 'pde', 'fisher', 'gray-scott', 'wave'):
+        if mode not in ('fdm', 'be', 'cn', 'pde', 'fisher', 'gray-scott', 'wave',
+                        'schrodinger'):
             mode = 'fdm'
 
         # Diffusion number. The explicit scheme is only stable to 0.25, so it
@@ -405,6 +406,20 @@ def run_simulation():
             wave_steps = _clamp(data.get('waveSteps', 1200), 1, 200000, 1200)
             wave_ic = 'impulse' if str(data.get('waveIC', 'pluck')) == 'impulse' else 'pluck'
             cmd.extend([str(wave_c), wave_bc, str(wave_steps), wave_ic])
+
+        elif mode == 'schrodinger':
+            # Same shape as wave: its own trailing parameters, and no boundary
+            # temperatures - the edges are hard walls holding psi = 0.
+            #
+            # The potential is a word that lands in argv, so it is matched
+            # against a whitelist rather than passed through. dt is chosen
+            # inside the binary; Crank-Nicolson has no stability limit, so
+            # there is no equivalent of F or the CFL number to expose.
+            potential = str(data.get('potential', 'free'))
+            if potential not in ('free', 'well', 'harmonic'):
+                potential = 'free'
+            q_steps = _clamp(data.get('schrodingerSteps', 1200), 1, 200000, 1200)
+            cmd.extend([potential, str(q_steps)])
 
         elif mode in ('fisher', 'gray-scott'):
             # Reaction-diffusion takes its own parameters instead of heat

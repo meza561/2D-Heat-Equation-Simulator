@@ -383,6 +383,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const waveC        = document.getElementById('waveC');
     const waveBoundary = document.getElementById('waveBoundary');
     const waveSteps    = document.getElementById('waveSteps');
+    const qParams      = document.getElementById('schrodinger-params');
+    const qIntro       = document.getElementById('schrodinger-intro');
+    const qHint        = document.getElementById('schrodinger-hint');
+    const qPotential   = document.getElementById('potential');
+    const qSteps       = document.getElementById('schrodingerSteps');
 
     const rd = {
         steps: document.getElementById('rdSteps'),
@@ -419,18 +424,19 @@ document.addEventListener('DOMContentLoaded', () => {
         const isImplicit = (mode === 'be' || mode === 'cn');
         const isRD = (mode === 'fisher' || mode === 'gray-scott');
         const isWave = (mode === 'wave');
+        const isSchrodinger = (mode === 'schrodinger');
 
         // Reaction-diffusion has no boundary temperatures (edges are zero-flux)
         // and no heat sources; it seeds itself. The wave solver has no
         // diffusivity at all, and its edges are clamped or free rather than
         // held at a temperature.
-        alphaParamsDiv.classList.toggle('hidden', isPde || isRD || isWave);
-        if (psGroup) psGroup.classList.toggle('hidden', isPde || isRD || isWave);
+        alphaParamsDiv.classList.toggle('hidden', isPde || isRD || isWave || isSchrodinger);
+        if (psGroup) psGroup.classList.toggle('hidden', isPde || isRD || isWave || isSchrodinger);
         // The analytical solution assumes uniform alpha and Dirichlet edges;
         // reaction-diffusion has its own diffusivities and zero-flux edges.
         const matGroup = document.getElementById('mat-group');
-        if (matGroup) matGroup.classList.toggle('hidden', isPde || isRD || isWave);
-        if (boundaryGroup) boundaryGroup.classList.toggle('hidden', isRD || isWave);
+        if (matGroup) matGroup.classList.toggle('hidden', isPde || isRD || isWave || isSchrodinger);
+        if (boundaryGroup) boundaryGroup.classList.toggle('hidden', isRD || isWave || isSchrodinger);
         if (isPde) timeCtrl.classList.add('hidden');
 
         // F is only a free parameter for the implicit schemes. The explicit
@@ -446,6 +452,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 + 'limit c\u0394t/\u0394x \u2264 1/\u221a2, so c cannot '
                 + 'destabilise the run \u2014 it sets how much physical time '
                 + 'the run spans, the way \u03b1 does for heat.';
+        }
+
+        if (qParams) qParams.classList.toggle('hidden', !isSchrodinger);
+        if (isSchrodinger) {
+            qIntro.innerHTML = 'A quantum particle: '
+                + '<em>i</em>\u2202<em>\u03c8</em>/\u2202<em>t</em> = '
+                + '\u2212\u00bd\u2207\u00b2<em>\u03c8</em> + '
+                + '<em>V\u03c8</em>, in natural units. The plate shows '
+                + '<strong>|\u03c8|\u00b2</strong>, the probability density '
+                + '\u2014 non-negative, so it uses the same thermal key the '
+                + 'heat modes do.';
+            qHint.textContent = 'Crank\u2013Nicolson, because it is exactly '
+                + 'unitary: total probability is conserved to rounding error. '
+                + 'An explicit scheme is unconditionally unstable here, so '
+                + 'probability would grow out of nothing.';
         }
 
         if (fParams) fParams.classList.toggle('hidden', !isImplicit);
@@ -782,6 +803,8 @@ document.addEventListener('DOMContentLoaded', () => {
             waveC: parseFloat(waveC.value),
             waveBoundary: waveBoundary.value,
             waveSteps: parseInt(waveSteps.value),
+            potential: qPotential.value,
+            schrodingerSteps: parseInt(qSteps.value),
             materials: validMaterials(),
             insulated: {
                 top: insBoxes.top.checked, bottom: insBoxes.bottom.checked,
@@ -799,12 +822,16 @@ document.addEventListener('DOMContentLoaded', () => {
         const rdMode = inputs.mode.value === 'fisher' ? 'u'
                      : (inputs.mode.value === 'gray-scott' ? 'v' : null);
         const isWaveRun = inputs.mode.value === 'wave';
+        const isQuantumRun = inputs.mode.value === 'schrodinger';
         // Wave amplitude is a signed displacement, not a temperature or a
         // concentration, and the wave solver does advance in seconds.
-        fieldUnit = isWaveRun ? '' : (rdMode ? ' ' + rdMode : '°C');
+        // |psi|^2 is a probability density: dimensionless, non-negative, and
+        // advancing in natural units (hbar = m = 1) rather than seconds.
+        fieldUnit = (isWaveRun || isQuantumRun) ? '' : (rdMode ? ' ' + rdMode : '°C');
         fieldLabel = isWaveRun ? 'Amplitude'
+                   : isQuantumRun ? 'Probability density |\u03c8|\u00b2'
                    : (rdMode ? 'Concentration ' + rdMode : 'Temperature');
-        timeSuffix = rdMode ? '' : ' s';
+        timeSuffix = (rdMode || isQuantumRun) ? '' : ' s';
 
         // A signed field needs the diverging map to read correctly, so switch
         // to it for wave runs - and switch back off it when leaving wave, so

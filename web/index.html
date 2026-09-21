@@ -66,6 +66,7 @@
                             <option value="fisher">Fisher&ndash;KPP (population front)</option>
                             <option value="gray-scott">Gray&ndash;Scott (Turing patterns)</option>
                             <option value="wave">Wave (leapfrog)</option>
+                            <option value="schrodinger">Schr&ouml;dinger (Crank&ndash;Nicolson)</option>
                         </select>
                     </div>
 
@@ -132,6 +133,19 @@
                             <option value="free">Free (reflecting)</option>
                         </select>
                         <p class="ps-hint" id="wave-hint"></p>
+                    </div>
+
+                    <div id="schrodinger-params" class="input-group hidden">
+                        <p class="ps-hint" id="schrodinger-intro"></p>
+                        <label for="potential">Potential</label>
+                        <select id="potential" class="mode-select">
+                            <option value="free">Free particle (V = 0)</option>
+                            <option value="well">Infinite square well</option>
+                            <option value="harmonic">Harmonic oscillator</option>
+                        </select>
+                        <label for="schrodingerSteps">Steps</label>
+                        <input type="number" id="schrodingerSteps" value="1200" step="100" min="1" max="200000">
+                        <p class="ps-hint" id="schrodinger-hint"></p>
                     </div>
 
                     <div id="f-params" class="input-group hidden">

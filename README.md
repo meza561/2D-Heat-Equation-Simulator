@@ -131,6 +131,65 @@ zero - white is zero displacement - and the solver reports the range it spanned
 over the whole run in its JSON so the colours do not rescale when the timeline
 is scrubbed back toward the louder opening frames.
 
+### Schrodinger equation (Crank-Nicolson)
+The first mode whose state is **complex**. Heat, reaction-diffusion and wave
+all evolve a real field; here the state is $\psi = u + iv$ and what is observed
+is $|\psi|^2$.
+
+$$i \frac{\partial \psi}{\partial t} = -\tfrac{1}{2} \nabla^2 \psi + V(x,y)\,\psi
+\qquad (\hbar = m = 1)$$
+
+Time stepping is Crank-Nicolson, applied as the Cayley transform
+
+$$\psi^{n+1} = \left(I + \tfrac{i\Delta t}{2} H\right)^{-1}
+               \left(I - \tfrac{i\Delta t}{2} H\right) \psi^n$$
+
+**Unitarity is the reason, and it is physics rather than taste.** For Hermitian
+$H$ that transform is *exactly* unitary, so total probability is conserved to
+rounding error. Forward Euler is not merely less accurate here, it is
+unconditionally **unstable**: its amplification factor is
+$|1 - i E \Delta t| = \sqrt{1 + E^2\Delta t^2} > 1$ for every mode, so
+probability grows out of nothing, fastest at the highest energies. This is the
+opposite of the heat equation, where explicit errors are dissipative and damp
+toward the steady state the solution was heading for anyway — there they hide,
+here they are unmissable.
+
+As with the implicit heat schemes, the 2D solve is split by direction into one
+tridiagonal system per grid line; the Thomas solver is literally the same code,
+extracted to `tridiagonal.hpp` and templated on the scalar type so it serves
+both the real heat sweeps and these complex ones. Splitting normally costs an
+$O(\Delta t^3)$ commutator term, but every potential offered is **separable**,
+$V = V_x(x) + V_y(y)$, so $H_x$ and $H_y$ commute exactly and it costs nothing.
+
+| Property | Value |
+|---|---|
+| Stability | unconditional, and exactly norm-preserving |
+| Accuracy | O($\Delta t^2$), O($\Delta x^2$) |
+| Edges | $\psi = 0$ (hard walls), which is what makes $H$ Hermitian |
+| Potentials | free ($V=0$), infinite square well, harmonic $\tfrac{1}{2}\omega^2 r^2$ |
+
+**It stores $|\psi|^2$, not $\psi$.** The probability density is non-negative,
+so it travels the same 0..max export path, database schema and thermal colour
+key the heat modes already use, rather than needing wave's signed symmetric
+range. The phase is discarded on export — interference still appears, because
+it has already happened in $\psi$ before the modulus is taken, but colouring
+*by* phase would need a second field carried through the database and the JSON.
+That is the obvious extension and is deliberately not built yet.
+
+Three checks pin it, each catching what the others cannot:
+
+| Check | Holds to |
+|---|---|
+| Norm conservation over 800 steps (unitarity) | < 1e-10 relative |
+| Free packet spreading, $\sigma(t)^2 = \sigma_0^2 + (t/2\sigma_0)^2$ | 0.1% |
+| Square-well ground state stationary in $|\psi|^2$ | rounding error |
+
+The last is exact rather than approximate because $\sin(\pi j/(N-1))$ is an
+eigenvector of the *discrete* Laplacian, not just the continuum one. The
+harmonic ground state is only the continuum eigenstate, so on a grid it
+breathes slightly (1.2e-3 of peak) — both are tested, and both carry a negative
+control so a solver that had simply stopped evolving would fail.
+
 ## Temporal Scaling
 
 The explicit FDM scheme is stable only while the diffusion number

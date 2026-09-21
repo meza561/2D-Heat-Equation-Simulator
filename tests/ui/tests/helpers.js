@@ -93,7 +93,10 @@ async function runSimulation(page, opts = {}) {
   // no boundary temperatures (its edges are clamped or free, not held at a
   // value) - so filling those inputs would wait forever on a hidden field.
   const isWave = o.mode === 'wave';
-  const noHeatInputs = isRD || isWave;
+  // Schrodinger hides the same panels for the same reason: no diffusivity, no
+  // sources, and hard walls instead of boundary temperatures.
+  const isSchrodinger = o.mode === 'schrodinger';
+  const noHeatInputs = isRD || isWave || isSchrodinger;
 
   await page.selectOption('#simMode', o.mode);
   await page.fill('#rows', String(o.rows));
@@ -124,6 +127,12 @@ async function runSimulation(page, opts = {}) {
     if (o.waveSteps !== undefined) await page.fill('#waveSteps', String(o.waveSteps));
     if (o.waveC !== undefined) await page.fill('#waveC', String(o.waveC));
     if (o.waveBoundary !== undefined) await page.selectOption('#waveBoundary', o.waveBoundary);
+  }
+  if (isSchrodinger) {
+    if (o.schrodingerSteps !== undefined) {
+      await page.fill('#schrodingerSteps', String(o.schrodingerSteps));
+    }
+    if (o.potential !== undefined) await page.selectOption('#potential', o.potential);
   }
   if (o.mode === 'fisher') {
     if (o.rdD !== undefined) await page.fill('#fkD', String(o.rdD));

@@ -14,6 +14,7 @@
 #include "simulation.hpp"
 #include "reaction.hpp"
 #include "wave.hpp"
+#include "schrodinger.hpp"
 
 /**
  * @param rangeMin,rangeMax  the field's range over the whole run, when the
@@ -196,7 +197,8 @@ int main(int argcRaw, char* argvRaw[]) {
         // other models read their own parameters from the same positions, and
         // wave's boundary type is a word ("fixed"/"free"), so parsing it as a
         // source coordinate throws rather than quietly producing junk.
-        if (mode != "wave" && mode != "fisher" && mode != "gray-scott") {
+        if (mode != "wave" && mode != "schrodinger"
+            && mode != "fisher" && mode != "gray-scott") {
             for (int k = 10; k + 2 < argc; k += 3) {
                 sources.push_back({ std::stoi(argv[k]),
                                     std::stoi(argv[k + 1]),
@@ -231,20 +233,21 @@ int main(int argcRaw, char* argvRaw[]) {
     }
 
     const bool isWave = (mode == "wave");
+    const bool isSchrodinger = (mode == "schrodinger");
     const bool isReactionDiffusion = (mode == "fisher" || mode == "gray-scott");
 
     // F is the heat solver's diffusion number. The wave and reaction-diffusion
     // models derive their own step size and ignore it, so warning about it
     // there would be describing a limit that does not apply to the run.
     if (method == HeatSimulation::Method::Explicit && F_TARGET > 0.25
-            && !isWave && !isReactionDiffusion) {
+            && !isWave && !isSchrodinger && !isReactionDiffusion) {
         std::cout << "Warning: F = " << F_TARGET
                   << " exceeds the explicit stability limit of 0.25; "
                      "the solution will diverge.\n";
     }
 
     DT = F_TARGET * DX * DX / ALPHA;
-    if (!isReactionDiffusion && !isWave) {
+    if (!isReactionDiffusion && !isWave && !isSchrodinger) {
         if (mode != "pde") {
             std::cout << "Scheme: " << methodName << "\n";
         }
@@ -263,7 +266,7 @@ int main(int argcRaw, char* argvRaw[]) {
     if (cells * frames > SAMPLE_BUDGET) {
         long long scale = (cells * frames + SAMPLE_BUDGET - 1) / SAMPLE_BUDGET;
         SAVE_INTERVAL *= static_cast<int>(scale);
-        if (!isReactionDiffusion && !isWave) {   // those set their own frame budget below
+        if (!isReactionDiffusion && !isWave && !isSchrodinger) {   // those set their own frame budget below
             std::cout << "Large grid (" << ROWS << "x" << COLS
                       << "): saving every " << SAVE_INTERVAL << " steps\n";
         }
@@ -300,7 +303,114 @@ int main(int argcRaw, char* argvRaw[]) {
 
     if (!db.init()) return 1;
 
-    if (mode == "wave") {
+    if (mode == "schrodinger") {
+        // ---- Schrodinger equation --------------------------------------
+        // i psi_t = -1/2 lap(psi) + V psi. Crank-Nicolson via a Cayley
+        // transform in each direction; see schrodinger.hpp for why an
+        // explicit scheme is not an option here.
+        //
+        // The exported field is |psi|^2, the probability density. It is
+        // non-negative, so it travels the same 0..max export path the heat
+        // modes use rather than wave's symmetric signed range.
+        //
+        // Only |psi|^2 is stored. The phase is discarded, which is what makes
+        // that reuse possible; interference still shows up, because it has
+        // already happened in psi by the time the modulus is taken. Storing
+        // the phase (or u and v separately) would allow colouring by phase
+        // and is the obvious future extension - it needs a second field in
+        // the database schema and in the JSON, so it is deliberately not
+        // done here.
+        const std::string potArg = (argc > 10) ? argv[10] : "free";
+        int qSteps = (argc > 11) ? std::stoi(argv[11]) : 1200;
+        if (qSteps < 1) qSteps = 1;
+        if (qSteps > 200000) qSteps = 200000;
+
+        using Q = SchrodingerSimulation;
+        Q::Potential pot = Q::Potential::Free;
+        std::string potName = "free particle";
+        if (potArg == "well" || potArg == "square-well") {
+            pot = Q::Potential::SquareWell;
+            potName = "infinite square well";
+        } else if (potArg == "harmonic") {
+            pot = Q::Potential::Harmonic;
+            potName = "harmonic oscillator";
+        }
+
+        // dx = 1 grid unit, as the wave solver does. Crank-Nicolson is
+        // unconditionally stable, so dt is set by what makes the animation
+        // read rather than by a stability limit: the packet should cross the
+        // box, or the oscillator complete a couple of periods, over the run.
+        const double qDx = 1.0;
+        const double span = std::min(ROWS, COLS) * qDx;
+        const double sigma0 = span / 17.0;          // a few percent of the box
+        const double qDt = (pot == Q::Potential::Harmonic) ? 1.0 : 0.2;
+
+        Q q(ROWS, COLS, qDx, qDt);
+        // omega is fixed by the width the box can show: a well too tight to
+        // resolve on the grid, or too loose to fit inside it, is no use.
+        const double omega = 1.0 / (2.0 * sigma0 * sigma0);
+        q.setPotential(pot, omega);
+
+        if (pot == Q::Potential::Harmonic) {
+            // A coherent state: the ground-state Gaussian, displaced. It
+            // oscillates across the well at frequency omega WITHOUT
+            // spreading, which is the one bound-state behaviour with no
+            // classical analogue worth watching.
+            q.seedGaussian(-span / 5.0, 0.0, q.groundStateSigma());
+            std::cout << "Schrodinger: " << potName << ", omega=" << omega
+                      << ", period " << (2.0 * M_PI / omega) << "\n";
+        } else {
+            // A packet with momentum, so it travels as well as spreads. In
+            // the well the walls are the point: it reflects and interferes
+            // with itself. Free means the same box, with the packet meant to
+            // stay clear of the walls for as long as it can.
+            q.seedGaussian(-span / 4.0, 0.0, sigma0, 0.5, 0.0);
+            std::cout << "Schrodinger: " << potName << ", sigma0=" << sigma0
+                      << ", momentum k=0.5\n";
+        }
+        std::cout << "dt = " << qDt << " (Crank-Nicolson is unconditionally "
+                     "stable, so this is an accuracy choice)\n";
+
+        int saveEvery = std::max(1, qSteps / 150);
+        const long long qCells = static_cast<long long>(ROWS) * COLS;
+        const long long Q_BUDGET = 3000000LL;
+        while ((qSteps / saveEvery + 1) * qCells > Q_BUDGET) saveEvery *= 2;
+        std::cout << "Running " << qSteps << " steps, saving every "
+                  << saveEvery << "\n";
+
+        if (!db.beginRun()) return 1;
+        // |psi|^2 peaks at t = 0 for a spreading packet and falls thereafter,
+        // so the final frame understates the run's range. Track it, exactly
+        // as the wave solver does, or the frontend rescales mid-timeline.
+        double qMin = 0.0, qMax = 0.0;
+        auto trackRange = [&](const Q::Grid& g) {
+            for (const auto& row : g)
+                for (double v : row) { qMin = std::min(qMin, v); qMax = std::max(qMax, v); }
+        };
+        db.saveTimestep(0, q.field());
+        trackRange(q.field());
+        const double p0 = q.totalProbability();
+        for (int s = 1; s <= qSteps; ++s) {
+            q.step();
+            if (s % saveEvery == 0 || s == qSteps) {
+                db.saveTimestep(s, q.field());
+                trackRange(q.field());
+            }
+        }
+        if (!db.endRun()) return 1;
+
+        // Unitarity is the one property worth reporting: if this has drifted,
+        // the run is not quantum mechanics and the picture is meaningless.
+        std::cout << "Total probability: " << std::setprecision(12) << p0
+                  << " -> " << q.totalProbability() << "\n";
+
+        exportToJSON(jsonPath, qSteps, ROWS, COLS, q.field(),
+                     qDt, saveEvery, "Schrodinger (Crank-Nicolson)", F_TARGET,
+                     qMin, qMax);
+        std::cout << "Simulation complete. Output written to " << jsonPath << "\n";
+        return 0;
+
+    } else if (mode == "wave") {
         // ---- Wave equation ---------------------------------------------
         // u_tt = c^2 lap(u). Second order in time, so the solver carries two
         // time levels; see wave.hpp. Nothing here converges - a clamped

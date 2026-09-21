@@ -22,6 +22,7 @@ test('no console errors across a full run of all seven modes', async ({ page }) 
     { mode: 'fisher', rdSteps: 300 },
     { mode: 'gray-scott', rdSteps: 300 },
     { mode: 'wave', waveSteps: 200 },
+    { mode: 'schrodinger', schrodingerSteps: 200, potential: 'harmonic' },
   ];
   for (const opts of runs) {
     const { isError, statusText } = await runSimulation(page, { rows: 20, cols: 20, ...opts });
