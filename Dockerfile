@@ -9,7 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 # Only what the binary needs, so a web/ or test edit does not rebuild it.
-COPY main.cpp database.cpp database.hpp simulation.hpp reaction.hpp wave.hpp ./
+# Every .hpp here is solver code, so glob them - naming them one by one is how
+# a deploy once broke on a newly added header that built fine everywhere else.
+COPY *.hpp main.cpp database.cpp ./
 RUN g++ -std=c++17 -O2 main.cpp database.cpp -lsqlite3 -o heat_sim
 
 FROM python:3.12-slim
