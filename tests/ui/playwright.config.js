@@ -8,11 +8,13 @@ module.exports = defineConfig({
   testDir: './tests',
   // Not the default 5s: a run has to launch the solver and come back.
   expect: { timeout: 15_000 },
-  // server.py is explicitly single-writer (one DB file, one latest_heatmap.json,
-  // guarded on the write side by SIM_LOCK - see CLAUDE.md). A GET made after this
-  // suite's own POST can still race a *different* worker's POST clearing the DB
-  // between them, so tests run serially against the one server instance rather
-  // than in parallel workers.
+  // Conservative now, rather than required. This was set when every run shared
+  // one database, so a GET after this suite's own POST could land after a
+  // different worker's run had already cleared the table. Per-run files (see
+  // RUNS_DIR in server.py) removed that race. What is left is weaker: the rate
+  // limiter counts per IP across the whole suite, and SIM_LOCK serialises the
+  // solver processes anyway, so parallel workers would buy little. Check both
+  // before raising this.
   workers: 1,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
