@@ -343,12 +343,21 @@ int main(int argcRaw, char* argvRaw[]) {
         const double qDx = 1.0;
         const double span = std::min(ROWS, COLS) * qDx;
         const double sigma0 = span / 17.0;          // a few percent of the box
-        const double qDt = (pot == Q::Potential::Harmonic) ? 1.0 : 0.2;
-
-        Q q(ROWS, COLS, qDx, qDt);
         // omega is fixed by the width the box can show: a well too tight to
         // resolve on the grid, or too loose to fit inside it, is no use.
         const double omega = 1.0 / (2.0 * sigma0 * sigma0);
+
+        // Crank-Nicolson is unconditionally stable, so dt is set by what the
+        // SAVED FRAMES have to resolve rather than by a limit. The harmonic
+        // run is periodic, so its step is tied to the period: at a flat
+        // dt = 1 a 20x20 run covered 69 periods in 150 frames, landing
+        // consecutive frames ~0.46 of a period apart, and a real oscillation
+        // aliased into jitter about the centre. 200 steps per period leaves
+        // ~25 frames per period once saveEvery has thinned them.
+        const double qPeriod = 2.0 * M_PI / omega;
+        const double qDt = (pot == Q::Potential::Harmonic) ? qPeriod / 200.0 : 0.2;
+
+        Q q(ROWS, COLS, qDx, qDt);
         q.setPotential(pot, omega);
 
         if (pot == Q::Potential::Harmonic) {

@@ -416,6 +416,49 @@ def test_post_run_builds_fisher_arguments(client, monkeypatch):
     assert not any(arg.startswith('--insulate=') for arg in cmd)
 
 
+def test_post_run_builds_schrodinger_arguments(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    client.post('/run', json={
+        'rows': 20, 'cols': 20, 'mode': 'schrodinger',
+        'potential': 'harmonic', 'schrodingerSteps': 321,
+        # The edges are hard walls holding psi = 0, so boundary temperatures
+        # and heat sources do not apply here any more than they do to wave.
+        'top': 100, 'hasPointSource': True,
+        'sources': [{'x': 1, 'y': 1, 'temp': 100}],
+    })
+
+    cmd = calls[0]
+    assert positional(cmd)[7] == 'schrodinger'
+    assert positional(cmd)[10:] == ['harmonic', '321']
+    assert not any(arg.startswith('--insulate=') for arg in cmd)
+
+
+@pytest.mark.parametrize('sent', ['coulomb', '', 'harmonic; rm -rf /', '../free', 42])
+def test_post_run_rejects_an_unknown_potential(client, monkeypatch, sent):
+    # The potential is a word that ends up in argv, so an unrecognised one has
+    # to fall back rather than be passed through. The binary whitelists it too,
+    # but this is the layer that faces the network.
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    client.post('/run', json={'mode': 'schrodinger', 'potential': sent})
+
+    assert positional(calls[0])[10] == 'free'
+
+
+def test_post_run_clamps_schrodinger_steps(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    client.post('/run', json={'mode': 'schrodinger', 'schrodingerSteps': 10 ** 9})
+    assert positional(calls[0])[11] == '200000'
+
+    client.post('/run', json={'mode': 'schrodinger', 'schrodingerSteps': 0})
+    assert positional(calls[1])[11] == '1'
+
+
 def test_post_run_builds_gray_scott_arguments(client, monkeypatch):
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
