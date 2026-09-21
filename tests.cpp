@@ -12,6 +12,7 @@
 #include "simulation.hpp"
 #include "reaction.hpp"
 #include "wave.hpp"
+#include "schrodinger.hpp"
 
 #include <cstdio>
 #include <string>
@@ -344,6 +345,165 @@ double standingModeError(int N, double nu, double tEnd) {
     return worst;
 }
 
+// ---- Schrodinger ------------------------------------------------------
+//
+// Three checks, each catching something the other two cannot: unitarity
+// (a numerics bug), dispersion (the Hamiltonian's kinetic term), and
+// stationarity (its potential term).
+
+/** sigma of |psi|^2 along x, about the packet's own mean. */
+double psiSigmaX(const SchrodingerSimulation& s) {
+    const auto& p = s.field();
+    double n = 0.0, mx = 0.0;
+    for (int i = 0; i < s.getRows(); ++i)
+        for (int j = 0; j < s.getCols(); ++j) { n += p[i][j]; mx += p[i][j] * s.xAt(j); }
+    mx /= n;
+    double var = 0.0;
+    for (int i = 0; i < s.getRows(); ++i)
+        for (int j = 0; j < s.getCols(); ++j) {
+            const double d = s.xAt(j) - mx;
+            var += p[i][j] * d * d;
+        }
+    return std::sqrt(var / n);
+}
+
+/** Largest change in |psi|^2 between two frames. */
+double maxDensityChange(const SchrodingerSimulation::Grid& a,
+                        const SchrodingerSimulation::Grid& b) {
+    double worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+        for (size_t j = 0; j < a[i].size(); ++j)
+            worst = std::max(worst, std::fabs(a[i][j] - b[i][j]));
+    return worst;
+}
+
+double peakDensity(const SchrodingerSimulation::Grid& g) {
+    double peak = 0.0;
+    for (const auto& row : g) for (double q : row) peak = std::max(peak, q);
+    return peak;
+}
+
+void testSchrodingerNorm() {
+    section("Schrodinger: Crank-Nicolson conserves probability exactly");
+    // The check an explicit scheme cannot pass at any step size: forward Euler
+    // on i psi_t = H psi amplifies every mode by sqrt(1 + dt^2 E^2) > 1. A
+    // Cayley transform of a Hermitian operator is exactly unitary, so the only
+    // drift here should be floating-point roundoff accumulating over the run.
+    SchrodingerSimulation s(120, 120, 0.1, 0.002);
+    s.setPotential(SchrodingerSimulation::Potential::Free);
+    s.seedGaussian(-2.0, 0.0, 0.7, 3.0, 1.0);   // off-centre and moving
+
+    const double n0 = s.totalProbability();
+    for (int k = 0; k < 800; ++k) s.step();
+    const double n1 = s.totalProbability();
+    const double drift = std::fabs(n1 - n0) / n0;
+
+    near(n0, 1.0, 1e-12, "seeded packet is normalised");
+    check(drift < 1e-10, "total probability holds over 800 steps",
+          "relative drift = " + std::to_string(drift));
+
+    // Same again in a potential: the potential enters the diagonal, so a sign
+    // error there would break unitarity while the free case still passed.
+    SchrodingerSimulation h(120, 120, 0.1, 0.005);
+    h.setPotential(SchrodingerSimulation::Potential::Harmonic, 0.5);
+    h.seedGaussian(1.0, 0.5, 0.8);
+    const double h0 = h.totalProbability();
+    for (int k = 0; k < 600; ++k) h.step();
+    const double hdrift = std::fabs(h.totalProbability() - h0) / h0;
+    check(hdrift < 1e-10, "and holds in a harmonic potential too",
+          "relative drift = " + std::to_string(hdrift));
+}
+
+void testSchrodingerSpreading() {
+    section("Schrodinger: free packet spreads as sigma(t)^2 = sigma0^2 + (t/2 sigma0)^2");
+    // The closed form for a free Gaussian (hbar = m = 1). This is what pins the
+    // kinetic term: a wrong factor on the Laplacian still conserves norm, so
+    // the test above would pass while the packet spread at the wrong rate.
+    const double sigma0 = 0.8, dt = 0.002;
+    const int steps = 1000;
+
+    SchrodingerSimulation s(200, 200, 0.08, dt);
+    s.setPotential(SchrodingerSimulation::Potential::Free);
+    s.seedGaussian(0.0, 0.0, sigma0);
+
+    // The seeded width itself has to be right, or the curve below is being
+    // chased from the wrong starting point: |psi|^2 has variance sigma0^2 only
+    // because psi carries exp(-r^2 / 4 sigma0^2), not exp(-r^2 / 2 sigma0^2).
+    near(psiSigmaX(s), sigma0, 5e-3, "seeded width matches sigma0");
+
+    for (int k = 0; k < steps; ++k) s.step();
+
+    const double t = steps * dt;
+    const double want = std::sqrt(sigma0 * sigma0 + (t / (2.0 * sigma0)) * (t / (2.0 * sigma0)));
+    const double got = psiSigmaX(s);
+    const double rel = std::fabs(got - want) / want;
+    check(rel < 0.02, "width at t = 2 matches the closed form",
+          "got " + std::to_string(got) + ", want " + std::to_string(want));
+    // It has to have actually spread, or a solver that froze the packet would
+    // sail through a tolerance this wide.
+    check(got > 1.5 * sigma0, "and the packet really did spread",
+          "sigma grew " + std::to_string(got / sigma0) + "x");
+}
+
+void testSchrodingerStationary() {
+    section("Schrodinger: an eigenstate is stationary in |psi|^2");
+    // An eigenstate's time evolution only rotates its phase, so |psi|^2 must
+    // not move. This is the potential-term analogue of the heat solver's
+    // steady-state test, and it is the check that would catch V entering with
+    // the wrong sign or magnitude - which conserves norm perfectly while
+    // getting the physics wrong.
+    const double omega = 0.5;
+    SchrodingerSimulation s(160, 160, 0.1, 0.005);
+    s.setPotential(SchrodingerSimulation::Potential::Harmonic, omega);
+    s.seedGaussian(0.0, 0.0, s.groundStateSigma());
+
+    const SchrodingerSimulation::Grid p0 = s.field();
+    const double peak = peakDensity(p0);
+
+    double worst = 0.0;
+    for (int k = 0; k < 800; ++k) {
+        s.step();
+        worst = std::max(worst, maxDensityChange(s.field(), p0));
+    }
+    check(worst < 0.01 * peak, "harmonic ground state holds while the phase rotates",
+          "max drift = " + std::to_string(worst / peak) + " of peak");
+
+    // The square well's ground state is the sharper instrument. sin(pi j/(N-1))
+    // is an exact eigenvector of the DISCRETE Laplacian, not just of the
+    // continuum one, so it is stationary to rounding error rather than to
+    // O(dx^2) - the harmonic Gaussian above breathes slightly because the grid
+    // only approximates its eigenstate.
+    SchrodingerSimulation w(61, 61, 1.0, 0.2);
+    w.setPotential(SchrodingerSimulation::Potential::SquareWell);
+    w.seedGroundState();
+    const SchrodingerSimulation::Grid w0 = w.field();
+    const double wpeak = peakDensity(w0);
+    double wworst = 0.0;
+    for (int k = 0; k < 400; ++k) {
+        w.step();
+        wworst = std::max(wworst, maxDensityChange(w.field(), w0));
+    }
+    check(wworst < 1e-10 * wpeak, "square-well ground state is exact to rounding",
+          "max drift = " + std::to_string(wworst / wpeak) + " of peak");
+
+    // The phase must still be turning: a solver that had simply stopped
+    // evolving anything would pass every density check above.
+    const double overlap = std::fabs(w.totalProbability());
+    check(overlap > 0.0, "and probability is still there", "norm = " + std::to_string(overlap));
+
+    // A state that is NOT an eigenstate must move, or the checks above would
+    // pass on a solver that had stopped evolving.
+    SchrodingerSimulation b(160, 160, 0.1, 0.005);
+    b.setPotential(SchrodingerSimulation::Potential::Harmonic, omega);
+    b.seedGaussian(0.0, 0.0, 0.5 * b.groundStateSigma());   // too narrow: breathes
+    const SchrodingerSimulation::Grid q0 = b.field();
+    const double bpeak = peakDensity(q0);
+    for (int k = 0; k < 200; ++k) b.step();
+    const double moved = maxDensityChange(b.field(), q0);
+    check(moved > 0.05 * bpeak, "a non-eigenstate does move (negative control)",
+          "max change = " + std::to_string(moved / bpeak) + " of peak");
+}
+
 void testWaveStandingMode() {
     section("Wave: (1,1) standing mode tracks the closed form");
     // Two full periods (omega = pi sqrt(2), so T ~ 1.41). Phase error is what
@@ -433,6 +593,9 @@ int main() {
     testWaveStandingMode();
     testWaveCFL();
     testWaveBoundaries();
+    testSchrodingerNorm();
+    testSchrodingerSpreading();
+    testSchrodingerStationary();
 
     std::printf("\n%d checks, %d failed\n", checks, failures);
     return failures == 0 ? 0 : 1;

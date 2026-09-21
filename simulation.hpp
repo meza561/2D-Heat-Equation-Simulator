@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "tridiagonal.hpp"
+
 // Optional: the pragmas below are ignored when OpenMP is unavailable, which is
 // the default for Apple's clang. Nothing here depends on it being present.
 #ifdef _OPENMP
@@ -242,21 +244,13 @@ private:
         return (sum > 0.0) ? (2.0 * a * b / sum) : 0.0;
     }
 
-    /** Thomas algorithm: O(n) solve of a tridiagonal system. */
+    /** Thomas algorithm, shared with the Schrodinger solver - see
+     *  tridiagonal.hpp for why it is templated rather than living here. */
     static void thomas(const std::vector<double>& a, const std::vector<double>& b,
                        const std::vector<double>& c, const std::vector<double>& d,
                        std::vector<double>& x,
                        std::vector<double>& cp, std::vector<double>& dp) {
-        const int n = static_cast<int>(d.size());
-        cp[0] = c[0] / b[0];
-        dp[0] = d[0] / b[0];
-        for (int i = 1; i < n; ++i) {
-            const double m = b[i] - a[i] * cp[i - 1];
-            cp[i] = c[i] / m;
-            dp[i] = (d[i] - a[i] * dp[i - 1]) / m;
-        }
-        x[n - 1] = dp[n - 1];
-        for (int i = n - 2; i >= 0; --i) x[i] = dp[i] - cp[i] * x[i + 1];
+        thomasSolve(a, b, c, d, x, cp, dp);
     }
 
     /**
