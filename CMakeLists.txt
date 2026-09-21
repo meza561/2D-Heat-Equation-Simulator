@@ -60,6 +60,8 @@ add_executable(heat_sim
     simulation.hpp
     reaction.hpp
     wave.hpp
+    schrodinger.hpp
+    tridiagonal.hpp
 )
 
 # Not every CMake installation's FindSQLite3 defines the imported target -
@@ -73,12 +75,13 @@ endif()
 link_openmp(heat_sim)
 
 # Convergence / stability study. Shares the same solver headers as the app.
-add_executable(heat_study study.cpp simulation.hpp reaction.hpp)
+add_executable(heat_study study.cpp simulation.hpp reaction.hpp tridiagonal.hpp)
 link_openmp(heat_study)
 
 # Physics regression tests. Asserts the exact analytical values, convergence
 # orders, stability threshold and conservation laws.
-add_executable(heat_tests tests.cpp simulation.hpp reaction.hpp wave.hpp)
+add_executable(heat_tests tests.cpp simulation.hpp reaction.hpp wave.hpp
+                         schrodinger.hpp tridiagonal.hpp)
 link_openmp(heat_tests)
 
 enable_testing()
