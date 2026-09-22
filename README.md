@@ -535,11 +535,13 @@ message and everything else works.
 - `GET /`: Serves the frontend.
 - `POST /run`: Executes a simulation.
   - **Payload**: `{ "rows": 20, "cols": 20, "top": 100, "bottom": 0, "left": 0, "right": 0, "mode": "fdm", "alpha": 0.01 }`
-    - `mode`: `fdm` (explicit), `be` (backward Euler), `cn` (Crank-Nicolson), `pde` (analytical), `fisher`, `gray-scott`, `wave`
+    - `mode`: `fdm` (explicit), `be` (backward Euler), `cn` (Crank-Nicolson), `pde` (analytical), `fisher`, `gray-scott`, `wave`, `schrodinger`
+      (`explicit` is accepted as an alias for `fdm`; any other value is a 400, never a substitution - see below)
     - `insulated`: `{"top": false, "bottom": true, ...}` - zero-flux edges
     - `materials`: `[{"x0": 0, "y0": 28, "x1": 60, "y1": 32, "alpha": 0.0005}]` - diffusivity rectangles in bottom-left coordinates
     - reaction-diffusion: `rdSteps`, plus `rdD`/`rdR` for Fisher-KPP or `Du`/`Dv`/`feed`/`kill` for Gray-Scott
     - wave: `waveC` (speed), `waveBoundary` (`fixed`/`free`), `waveSteps`, `waveIC` (`pluck`/`impulse`)
+    - schrodinger: `potential` (`free`/`well`/`harmonic`), `schrodingerSteps`
     - `F`: diffusion number, implicit schemes only; explicit is pinned at 0.2
     - optional heat sources: `"hasPointSource": true, "sources": [{"x": 50, "y": 50, "temp": 1000}, {"x": 20, "y": 80, "temp": 500}]`
       (coordinates are bottom-left origin; out-of-range values are clamped to the grid.
@@ -548,6 +550,15 @@ message and everything else works.
   - **Response**: `{ "status", "output", "data": { "step", "rows", "cols", "dt", "saveInterval", "min", "max", "data" } }`
     (`min`/`max` are the range the field spanned over the run, so a signed field can be scaled without assuming 0-100)
   - On failure, `message` carries the solver's actual stderr.
+  - **400** for an unrecognised `mode` or `potential`, with the accepted values
+    in `message`. These are the two fields naming a solver, and they are refused
+    rather than defaulted: substituting one returns `"status": "success"` and a
+    full grid from a *different* simulation than the caller asked for, which is
+    indistinguishable from a working response unless the client re-reads
+    `data.scheme`. It is also how a server older than the mode being requested
+    looks healthy. Everything else - dimensions, temperatures, `alpha`, step
+    counts - is clamped rather than rejected, since a number out of range has an
+    unambiguous nearest valid value and a solver name does not.
 - `GET /run?time=X`: Retrieves the stored state at timestep X, snapping down to the nearest saved frame.
 - `GET /frames`: Lists the step numbers stored for the current run, so the timeline can address exact frames instead of guessing them from the save interval.
 - `GET /study`: Returns the convergence/stability results, or `{"status": "missing", "message": ...}` (still 200) if `./run_study.sh` has not been run.

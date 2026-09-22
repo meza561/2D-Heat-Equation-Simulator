@@ -127,11 +127,12 @@ jobs:
           import json
           d = json.load(open('response.json'))
           assert d['status'] == 'success', d
-          # Assert on the scheme, not just the status: an unrecognised mode
-          # falls back to fdm, which returns success and a heat run. Checking
-          # only the status is how a heat run passed for a Schrodinger request
-          # while this job was being written. The key is 'mode', not 'method' -
-          # an unknown field takes that same silent fallback.
+          # Assert on the scheme, not just the status. An unknown mode is a 400
+          # now, but an unknown *field* name still is not: 'method' instead of
+          # 'mode' leaves the key absent, which defaults to fdm and returns a
+          # heat run labelled success. That is what this assertion caught while
+          # the job was being written, and why it reads the scheme the solver
+          # reported rather than trusting the status.
           scheme = d['data'].get('scheme')
           assert scheme == 'Schrodinger (Crank-Nicolson)', f'got {scheme!r}'
           print('image ran the Schrodinger mode OK')

@@ -169,6 +169,31 @@ def _clamp_float(value, lo, hi, default):
     return max(lo, min(hi, v))
 
 
+MODES = ('fdm', 'be', 'cn', 'pde', 'fisher', 'gray-scott', 'wave',
+         'schrodinger')
+POTENTIALS = ('free', 'well', 'harmonic')
+
+
+def _unknown(field, value, allowed):
+    """400 for a value outside `allowed`, rather than substituting a default.
+
+    Silently coercing one is how a client that asks for something the server
+    does not have gets a successful response describing a different
+    simulation. That reads as working from the outside - status 'success',
+    a full grid, a plausible picture - right up until someone checks which
+    solver actually ran. A stale deploy answering a new client this way is
+    what this replaces.
+
+    The value is echoed back so the caller can see what was rejected, capped
+    because it arrives from the network.
+    """
+    return jsonify({
+        "status": "error",
+        "message": (f"Unknown {field} {str(value)[:40]!r}. "
+                    f"Expected one of: {', '.join(allowed)}"),
+    }), 400
+
+
 def get_grid_from_db(step, db_path):
     """Return the stored frame at or before `step`, from one run's database.
 
@@ -337,9 +362,8 @@ def run_simulation():
         mode = str(data.get('mode', 'fdm'))
         if mode == 'explicit':
             mode = 'fdm'
-        if mode not in ('fdm', 'be', 'cn', 'pde', 'fisher', 'gray-scott', 'wave',
-                        'schrodinger'):
-            mode = 'fdm'
+        if mode not in MODES:
+            return _unknown('mode', mode, MODES)
 
         # Diffusion number. The explicit scheme is only stable to 0.25, so it
         # is held there; the implicit schemes are unconditionally stable and
@@ -416,8 +440,8 @@ def run_simulation():
             # inside the binary; Crank-Nicolson has no stability limit, so
             # there is no equivalent of F or the CFL number to expose.
             potential = str(data.get('potential', 'free'))
-            if potential not in ('free', 'well', 'harmonic'):
-                potential = 'free'
+            if potential not in POTENTIALS:
+                return _unknown('potential', potential, POTENTIALS)
             q_steps = _clamp(data.get('schrodingerSteps', 1200), 1, 200000, 1200)
             cmd.extend([potential, str(q_steps)])
 

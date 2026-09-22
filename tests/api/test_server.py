@@ -437,15 +437,30 @@ def test_post_run_builds_schrodinger_arguments(client, monkeypatch):
 
 @pytest.mark.parametrize('sent', ['coulomb', '', 'harmonic; rm -rf /', '../free', 42])
 def test_post_run_rejects_an_unknown_potential(client, monkeypatch, sent):
-    # The potential is a word that ends up in argv, so an unrecognised one has
-    # to fall back rather than be passed through. The binary whitelists it too,
-    # but this is the layer that faces the network.
+    # The potential is a word that ends up in argv, so an unrecognised one is
+    # refused rather than passed through. The binary whitelists it too, but
+    # this is the layer that faces the network.
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
 
-    client.post('/run', json={'mode': 'schrodinger', 'potential': sent})
+    res = client.post('/run', json={'mode': 'schrodinger', 'potential': sent})
 
-    assert positional(calls[0])[10] == 'free'
+    assert res.status_code == 400
+    assert res.get_json()['status'] == 'error'
+    # Nothing was run: the rejection happens before the solver is invoked.
+    assert calls == []
+
+
+def test_post_run_rejects_a_potential_without_running_a_different_one(client, monkeypatch):
+    # The specific regression: substituting 'free' here returned success and a
+    # free-particle run to a caller that asked for a harmonic one.
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    res = client.post('/run', json={'mode': 'schrodinger', 'potential': 'coulomb'})
+
+    assert 'coulomb' in res.get_json()['message']
+    assert calls == []
 
 
 def test_post_run_clamps_schrodinger_steps(client, monkeypatch):
@@ -485,10 +500,51 @@ def test_post_run_pins_the_explicit_scheme_to_a_stable_diffusion_number(client, 
 
 
 def test_post_run_rejects_an_unknown_mode(client, monkeypatch):
+    # Falling back to fdm here meant a client asking for a mode this server
+    # does not have got a heat run labelled success - which is exactly how a
+    # stale deploy passed for a working one.
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
 
-    client.post('/run', json={'mode': 'nonsense'})
+    res = client.post('/run', json={'mode': 'nonsense'})
+
+    assert res.status_code == 400
+    body = res.get_json()
+    assert body['status'] == 'error'
+    assert 'nonsense' in body['message']
+    assert calls == []
+
+
+def test_post_run_error_lists_the_modes_it_does_accept(client, monkeypatch):
+    monkeypatch.setattr(server.subprocess, 'run', fake_run([]))
+
+    message = client.post('/run', json={'mode': 'nope'}).get_json()['message']
+
+    # The list is what tells a caller whether the server is simply older than
+    # the mode they asked for.
+    for mode in ('fdm', 'wave', 'schrodinger'):
+        assert mode in message
+
+
+def test_post_run_does_not_echo_an_unbounded_mode(client, monkeypatch):
+    # The value is reflected back, so it arrives from the network capped.
+    monkeypatch.setattr(server.subprocess, 'run', fake_run([]))
+
+    res = client.post('/run', json={'mode': 'x' * 5000})
+
+    assert res.status_code == 400
+    assert len(res.get_json()['message']) < 200
+
+
+def test_post_run_still_accepts_the_explicit_alias(client, monkeypatch):
+    # 'explicit' maps to fdm. Now that unknown modes are refused, losing the
+    # alias would turn an older client's payload into a 400.
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    res = client.post('/run', json={'mode': 'explicit'})
+
+    assert res.status_code == 200
     assert positional(calls[0])[7] == 'fdm'
 
 
