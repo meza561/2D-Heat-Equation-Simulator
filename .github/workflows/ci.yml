@@ -36,3 +36,48 @@ jobs:
           assert abs(centre - 25.0) < 0.05, f'centre {centre} is not ~25'
           print(f'binary smoke test OK (centre = {centre:.4f})')
           PY
+
+  api-tests:
+    name: Flask API tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-test.txt
+
+      # Flask's test client, so there is no server and no compiled binary to
+      # build here - it runs in seconds.
+      - name: Run API tests
+        run: python -m pytest tests/api -q
+
+  ui-tests:
+    name: Frontend end-to-end tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build, start the server, and run the Playwright suite
+        run: ./run_ui_tests.sh
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: tests/ui/playwright-report/

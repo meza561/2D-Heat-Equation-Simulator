@@ -103,10 +103,13 @@ def study():
     """Serve the convergence/stability results produced by ./run_study.sh."""
     path = 'study_results.json'
     if not os.path.exists(path):
+        # 200, not 404: "not generated yet" is the normal state of a fresh
+        # checkout (the file is a gitignored ./run_study.sh output), and the
+        # browser logs every non-2xx fetch as a console error.
         return jsonify({
-            "status": "error",
+            "status": "missing",
             "message": "No study results found."
-        }), 404
+        })
     try:
         with open(path) as f:
             return jsonify(json.load(f))
@@ -303,5 +306,6 @@ if __name__ == '__main__':
         print(f"Error: {SIM_BINARY} not found. Please build the project first.")
         exit(1)
     
-    print("Starting Heat Simulation Server on http://127.0.0.1:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    print(f"Starting Heat Simulation Server on http://127.0.0.1:{port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
