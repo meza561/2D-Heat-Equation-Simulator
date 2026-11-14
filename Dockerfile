@@ -12,11 +12,11 @@ WORKDIR /src
 # Every .hpp here is solver code, so glob them - naming them one by one is how
 # a deploy once broke on a newly added header that built fine everywhere else.
 COPY *.hpp main.cpp database.cpp ./
-RUN g++ -std=c++17 -O2 main.cpp database.cpp -lsqlite3 -o heat_sim
+RUN g++ -std=c++17 -O3 -fopenmp main.cpp database.cpp -lsqlite3 -o heat_sim
 
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libsqlite3-0 \
+        libsqlite3-0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

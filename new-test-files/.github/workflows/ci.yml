@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  physics-tests:
+    name: Physics regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run physics tests
+        run: ./build/heat_tests
+
+      - name: Check the app binary runs
+        run: |
+          ./build/heat_sim 21 21 100 0 0 0 fdm 0.01 0.2
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('latest_heatmap.json'))
+          centre = d['data'][10][10]
+          # exact steady-state centre for one hot edge on a square plate
+          assert abs(centre - 25.0) < 0.05, f'centre {centre} is not ~25'
+          print(f'binary smoke test OK (centre = {centre:.4f})')
+          PY
+
+  api-tests:
+    name: Flask API + storage integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-test.txt
+
+      # Flask's test client, so there is no server and no compiled binary to
+      # build here - it runs in seconds.
+      - name: Run API tests
+        run: python -m pytest tests/api -q
+
+      # The API tests seed databases by hand; these run the real binary and
+      # read back what it stored, so a writer/reader mismatch cannot pass.
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Build the solver binary
+        run: g++ -std=c++17 -O2 main.cpp database.cpp -lsqlite3 -o heat_sim
+
+      - name: Run binary storage integration tests
+        run: python -m pytest tests/integration -q
+
+  ui-tests:
+    name: Frontend end-to-end tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build, start the server, and run the Playwright suite
+        run: ./run_ui_tests.sh
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: tests/ui/playwright-report/
+
+  docker-image:
+    name: Deployment image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The only job that builds the way the deploy does. Its build stage copies
+      # a named subset of the repo, which makes it the one place a file can go
+      # missing while every other job stays green - the other three compile from
+      # a full checkout, where a header is on disk whether or not anything
+      # lists it. A new solver header once built fine in all three and broke
+      # only here.
+      - name: Build the image
+        run: docker build -t heat-sim .
+
+      # X-Forwarded-Proto because the image sets FLASK_ENV=production, so
+      # Talisman forces https and would 302 a plain http request. That is what
+      # the real proxy sends, so this covers the ProxyFix hop as well.
+      - name: Start the container
+        run: |
+          docker run -d --name heat -p 8080:8080 heat-sim
+          for _ in $(seq 60); do
+            if curl -sf -H 'X-Forwarded-Proto: https' http://localhost:8080/ >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo 'container never became ready' >&2
+          exit 1
+
+      # Schrodinger specifically: its solver lives entirely in headers, so a
+      # build stage that missed one cannot serve this even though the image
+      # built. Running it also covers the runtime stage - the binary landing in
+      # place, and runs/ being writable by the unprivileged user.
+      - name: Run a simulation through the image
+        run: |
+          curl -sf -X POST http://localhost:8080/run \
+            -H 'Content-Type: application/json' \
+            -H 'X-Forwarded-Proto: https' \
+            -d '{"rows":20,"cols":20,"mode":"schrodinger","potential":"harmonic","schrodingerSteps":200}' \
+            -o response.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('response.json'))
+          assert d['status'] == 'success', d
+          # Assert on the scheme, not just the status. An unknown mode is a 400
+          # now, but an unknown *field* name still is not: 'method' instead of
+          # 'mode' leaves the key absent, which defaults to fdm and returns a
+          # heat run labelled success. That is what this assertion caught while
+          # the job was being written, and why it reads the scheme the solver
+          # reported rather than trusting the status.
+          scheme = d['data'].get('scheme')
+          assert scheme == 'Schrodinger (Crank-Nicolson)', f'got {scheme!r}'
+          print('image ran the Schrodinger mode OK')
+          PY
+
+      - name: Container logs
+        if: failure()
+        run: docker logs heat

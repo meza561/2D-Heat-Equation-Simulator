@@ -7,6 +7,7 @@ suite in tests/ui exercises the same endpoints end to end.
 """
 import json
 import os
+import sqlite3
 import subprocess
 import time
 import types
@@ -63,7 +64,7 @@ def test_frames_lists_sorted_distinct_steps(client):
 
 
 def test_frames_survives_a_database_with_no_table(client):
-    # A file exists but the run never got as far as creating HeatMap.
+    # A file exists but the run never got as far as creating Frames.
     os.makedirs('runs', exist_ok=True)
     open(f'runs/{RUN_ID}.db', 'wb').close()
     assert client.get(f'/frames?run_id={RUN_ID}').get_json() == {'steps': []}
@@ -559,3 +560,55 @@ def test_post_run_accepts_the_legacy_single_source_payload(client, monkeypatch):
     })
 
     assert positional(calls[0])[10:13] == ['2', '3', '250.0']
+
+
+# ---- Frame storage: one BLOB per frame ----------------------------------
+
+def test_frame_values_round_trip_exactly(client):
+    # Doubles are stored as raw bytes, so nothing may be rounded on the way
+    # through: not 0.1, not a repeating fraction, not a subnormal.
+    values = [0.1, 1.0 / 3.0, -273.15, 1e-300, 5e-324, 1.7976931348623157e308]
+    seed_db({0: [values]})
+    body = client.get(f'/run?time=0&run_id={RUN_ID}').get_json()
+    assert body['data'] == [values]
+
+
+@pytest.mark.parametrize('rows,cols', [(2, 5), (5, 2), (1, 7), (7, 1)])
+def test_non_square_frames_keep_their_orientation(client, rows, cols):
+    # Each value encodes its own (row, col), so a transposed or mis-strided
+    # unpack cannot pass by accident.
+    grid = [[100.0 * i + j for j in range(cols)] for i in range(rows)]
+    seed_db({0: grid})
+    body = client.get(f'/run?time=0&run_id={RUN_ID}').get_json()
+    assert (body['rows'], body['cols']) == (rows, cols)
+    assert body['data'] == grid
+
+
+def _write_raw_frame(step, rows, cols, blob):
+    os.makedirs('runs', exist_ok=True)
+    conn = sqlite3.connect(f'runs/{RUN_ID}.db')
+    conn.execute('CREATE TABLE IF NOT EXISTS Frames (step INTEGER PRIMARY KEY, '
+                 'rows INTEGER NOT NULL, cols INTEGER NOT NULL, data BLOB NOT NULL);')
+    conn.execute('INSERT INTO Frames VALUES (?, ?, ?, ?)', (step, rows, cols, blob))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize('rows,cols,nbytes', [
+    (2, 2, 31),     # truncated mid-double
+    (2, 2, 24),     # one double short
+    (2, 2, 40),     # one double too many
+    (0, 4, 0),      # empty header
+])
+def test_a_corrupt_frame_is_a_404_not_a_crash(client, rows, cols, nbytes):
+    _write_raw_frame(0, rows, cols, b'\x00' * nbytes)
+    res = client.get(f'/run?time=0&run_id={RUN_ID}')
+    assert res.status_code == 404
+    assert res.is_json
+
+
+def test_frames_lists_every_stored_step_once(client):
+    # The old per-cell schema needed DISTINCT; one row per frame must still
+    # return each step exactly once, in order.
+    seed_db({s: [[float(s), 0.0], [0.0, 0.0]] for s in (40, 0, 10, 30, 20)})
+    assert client.get(f'/frames?run_id={RUN_ID}').get_json() == {'steps': [0, 10, 20, 30, 40]}

@@ -12,6 +12,7 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 from werkzeug.middleware.proxy_fix import ProxyFix
 import sqlite3
+from array import array
 
 # web/ holds both the static assets and the two pages rendered as templates
 # (index.html needs SITE_URL in its Open Graph tags, 404.html is served by the
@@ -208,42 +209,35 @@ def get_grid_from_db(step, db_path):
     try:
         cursor = conn.cursor()
 
-        # Index-only probe against the (step, x, y) primary key.
+        # Probe of the step primary key.
         cursor.execute(
-            "SELECT step FROM HeatMap WHERE step <= ? ORDER BY step DESC LIMIT 1",
+            "SELECT step, rows, cols, data FROM Frames WHERE step <= ? "
+            "ORDER BY step DESC LIMIT 1",
             (step,),
         )
         row = cursor.fetchone()
         if row is None:
-            cursor.execute("SELECT step FROM HeatMap ORDER BY step ASC LIMIT 1")
+            cursor.execute(
+                "SELECT step, rows, cols, data FROM Frames ORDER BY step ASC LIMIT 1")
             row = cursor.fetchone()
-        if row is None:
-            return None
-
-        actual_step = row[0]
-        cursor.execute(
-            "SELECT x, y, temp FROM HeatMap WHERE step = ? ORDER BY x, y",
-            (actual_step,),
-        )
-        rows_data = cursor.fetchall()
     except sqlite3.OperationalError:
         # No simulation has been run yet, so the table does not exist.
         return None
     finally:
         conn.close()
 
-    if not rows_data:
+    if row is None:
         return None
 
-    max_x = max(r[0] for r in rows_data) + 1
-    max_y = max(r[1] for r in rows_data) + 1
+    actual_step, rows, cols, blob = row
+    # The solver writes native doubles, row-major; it runs on this machine.
+    if rows <= 0 or cols <= 0 or len(blob) != rows * cols * array('d').itemsize:
+        return None
+    flat = array('d')
+    flat.frombytes(blob)
+    grid = [flat[i * cols:(i + 1) * cols].tolist() for i in range(rows)]
 
-    grid = [[0.0] * max_y for _ in range(max_x)]
-    for x, y, temp in rows_data:
-        grid[x][y] = temp
-
-    return {"step": actual_step, "rows": max_x, "cols": max_y, "data": grid}
-
+    return {"step": actual_step, "rows": rows, "cols": cols, "data": grid}
 
 @app.route('/')
 def index():
@@ -333,7 +327,7 @@ def frames():
     try:
         cursor = conn.cursor()
         # Index-only scan of the (step, x, y) primary key.
-        cursor.execute("SELECT DISTINCT step FROM HeatMap ORDER BY step")
+        cursor.execute("SELECT step FROM Frames ORDER BY step")
         steps = [r[0] for r in cursor.fetchall()]
     except sqlite3.OperationalError:
         steps = []          # nothing has been run yet

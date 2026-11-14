@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from array import array
 import sys
 import uuid
 
@@ -41,12 +42,12 @@ def seed_db(frames, run_id=RUN_ID):
     os.makedirs('runs', exist_ok=True)
     path = os.path.join('runs', f'{run_id}.db')
     conn = sqlite3.connect(path)
-    conn.execute('CREATE TABLE HeatMap ('
-                 'step INTEGER NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL, '
-                 'temp REAL NOT NULL, PRIMARY KEY (step, x, y)) WITHOUT ROWID;')
+    conn.execute('CREATE TABLE Frames (step INTEGER PRIMARY KEY, '
+                 'rows INTEGER NOT NULL, cols INTEGER NOT NULL, data BLOB NOT NULL);')
     for step, grid in frames.items():
-        for x, row in enumerate(grid):
-            for y, temp in enumerate(row):
-                conn.execute('INSERT INTO HeatMap VALUES (?, ?, ?, ?)', (step, x, y, temp))
+        flat = array('d', [t for row in grid for t in row])
+        conn.execute('INSERT INTO Frames VALUES (?, ?, ?, ?)',
+                     (step, len(grid), len(grid[0]), flat.tobytes()))
+
     conn.commit()
     conn.close()

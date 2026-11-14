@@ -37,6 +37,7 @@ private:
     sqlite3_stmt* insertStmt;
     std::string dbName;
     bool inTransaction;
+    std::vector<double> frameBuf; //scratch for packing frame
 };
 
 #endif

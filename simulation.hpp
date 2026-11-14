@@ -68,6 +68,7 @@ public:
             for (int j = std::max(0, std::min(j0, j1)); j <= std::min(cols - 1, std::max(j0, j1)); ++j)
                 alphaField[i][j] = a;
         heterogeneous = true;
+        adiDirty = true;
     }
 
     /**
@@ -267,96 +268,151 @@ private:
      * Every line is swept, including the boundary lines: pinned cells solve as
      * identity rows, so their values carry through untouched.
      */
-    double stepADI(bool crankNicolson) {
-        if (pinnedDirty) rebuildPinned();
-
-        // alpha now lives in the face conductivities rather than in r, so the
-        // tridiagonal coefficients vary from cell to cell.
+        /**
+     * The ADI matrices depend only on dt, the diffusivities and which cells
+     * are pinned - none of which change between steps. So the coefficients
+     * and the Thomas forward-elimination factors (cp and the pivot m) are
+     * built once here, and each step only runs the right-hand-side sweeps.
+     * The arithmetic is the same sequence as thomasSolve, so results are
+     * bit-identical to solving from scratch every step.
+     *
+     * Sweep-1 arrays are row-major [i*cols + j] (one system per row);
+     * sweep-2 arrays are column-major [j*rows + i] (one system per column),
+     * so each system reads contiguous memory.
+     */
+    void buildADI(bool crankNicolson) {
         const double rr = dt / (dx * dx);
         const double rc = crankNicolson ? 0.5 * rr : rr;
+        const size_t n = static_cast<size_t>(rows) * cols;
+        a1.assign(n, 0.0); cp1.assign(n, 0.0); m1.assign(n, 1.0);
+        aN1.assign(n, 0.0); aS1.assign(n, 0.0); pin1.assign(n, 0);
+        a2.assign(n, 0.0); cp2.assign(n, 0.0); m2.assign(n, 1.0);
+        aW2.assign(n, 0.0); aE2.assign(n, 0.0);
 
-        adiMid.assign(rows, std::vector<double>(cols, 0.0));
-        adiOut.assign(rows, std::vector<double>(cols, 0.0));
+        // Sweep 1: implicit along x.
+        for (int i = 0; i < rows; ++i) {
+            double cpPrev = 0.0;
+            for (int j = 0; j < cols; ++j) {
+                const size_t k = static_cast<size_t>(i) * cols + j;
+                double a = 0.0, b = 1.0, c = 0.0;
+                if (pinned[i][j]) {
+                    pin1[k] = 1;
+                } else {
+                    const double aW = (j > 0)        ? faceAlpha(i, j, i, j - 1) : 0.0;
+                    const double aE = (j < cols - 1) ? faceAlpha(i, j, i, j + 1) : 0.0;
+                    aN1[k] = (i > 0)        ? faceAlpha(i, j, i - 1, j) : 0.0;
+                    aS1[k] = (i < rows - 1) ? faceAlpha(i, j, i + 1, j) : 0.0;
+                    a = -rc * aW;
+                    b = 1.0 + rc * (aW + aE);
+                    c = -rc * aE;
+                }
+                const double m = (j == 0) ? b : b - a * cpPrev;
+                a1[k] = a; m1[k] = m; cp1[k] = c / m;
+                cpPrev = cp1[k];
+            }
+        }
 
-        // Each grid line is an independent tridiagonal system, so the sweeps
-        // parallelise cleanly. The Thomas scratch has to be per-thread, hence
-        // the explicit parallel region rather than a bare parallel-for.
+        // Sweep 2: implicit along y.
+        for (int j = 0; j < cols; ++j) {
+            double cpPrev = 0.0;
+            for (int i = 0; i < rows; ++i) {
+                const size_t k = static_cast<size_t>(j) * rows + i;
+                double a = 0.0, b = 1.0, c = 0.0;
+                if (!pinned[i][j]) {
+                    aW2[k] = (j > 0)        ? faceAlpha(i, j, i, j - 1) : 0.0;
+                    aE2[k] = (j < cols - 1) ? faceAlpha(i, j, i, j + 1) : 0.0;
+                    const double aN = (i > 0)        ? faceAlpha(i, j, i - 1, j) : 0.0;
+                    const double aS = (i < rows - 1) ? faceAlpha(i, j, i + 1, j) : 0.0;
+                    a = -rc * aN;
+                    b = 1.0 + rc * (aN + aS);
+                    c = -rc * aS;
+                }
+                const double m = (i == 0) ? b : b - a * cpPrev;
+                a2[k] = a; m2[k] = m; cp2[k] = c / m;
+                cpPrev = cp2[k];
+            }
+        }
+
+        adiRc = rc;
+        adiBuiltCN = crankNicolson;
+        adiBuiltDt = dt;
+        adiDirty = false;
+    }
+
+    double stepADI(bool crankNicolson) {
+        if (pinnedDirty) { rebuildPinned(); adiDirty = true; }
+        if (adiDirty || adiBuiltCN != crankNicolson || adiBuiltDt != dt)
+            buildADI(crankNicolson);
+        const double rc = adiRc;
+
+        // Allocated once; every cell is overwritten each step.
+        if (adiMid.size() != static_cast<size_t>(rows)) {
+            adiMid.assign(rows, std::vector<double>(cols, 0.0));
+            adiOut.assign(rows, std::vector<double>(cols, 0.0));
+        }
+
+        // --- sweep 1: implicit along x, one system per row ---
         #ifdef _OPENMP
         #pragma omp parallel
         #endif
         {
-        std::vector<double> a(cols), b(cols), c(cols), d(cols), x(cols), cp(cols), dp(cols);
-
-        // --- sweep 1: implicit along x, one system per row ---
+        std::vector<double> dp(cols);
         #ifdef _OPENMP
         #pragma omp for schedule(runtime)
         #endif
         for (int i = 0; i < rows; ++i) {
+            const size_t base = static_cast<size_t>(i) * cols;
             for (int j = 0; j < cols; ++j) {
-                if (pinned[i][j]) {
-                    a[j] = 0.0; b[j] = 1.0; c[j] = 0.0;
-                    d[j] = grid[i][j];
-                    continue;
+                const size_t k = base + j;
+                double d;
+                if (pin1[k]) {
+                    d = grid[i][j];
+                } else {
+                    double yFlux = 0.0;
+                    if (i > 0)        yFlux += aN1[k] * (grid[i - 1][j] - grid[i][j]);
+                    if (i < rows - 1) yFlux += aS1[k] * (grid[i + 1][j] - grid[i][j]);
+                    d = grid[i][j] + rc * yFlux;
                 }
-                const double aW = (j > 0)        ? faceAlpha(i, j, i, j - 1) : 0.0;
-                const double aE = (j < cols - 1) ? faceAlpha(i, j, i, j + 1) : 0.0;
-                const double aN = (i > 0)        ? faceAlpha(i, j, i - 1, j) : 0.0;
-                const double aS = (i < rows - 1) ? faceAlpha(i, j, i + 1, j) : 0.0;
-
-                a[j] = -rc * aW;
-                b[j] = 1.0 + rc * (aW + aE);
-                c[j] = -rc * aE;
-
-                double yFlux = 0.0;
-                if (i > 0)        yFlux += aN * (grid[i - 1][j] - grid[i][j]);
-                if (i < rows - 1) yFlux += aS * (grid[i + 1][j] - grid[i][j]);
-                d[j] = grid[i][j] + rc * yFlux;
+                dp[j] = (j == 0) ? d / m1[k] : (d - a1[k] * dp[j - 1]) / m1[k];
             }
-            thomas(a, b, c, d, x, cp, dp);
-            for (int j = 0; j < cols; ++j) adiMid[i][j] = x[j];
+            std::vector<double>& out = adiMid[i];
+            out[cols - 1] = dp[cols - 1];
+            for (int j = cols - 2; j >= 0; --j) out[j] = dp[j] - cp1[base + j] * out[j + 1];
         }
-
         } // end parallel region for sweep 1
 
+        // --- sweep 2: implicit along y, one system per column ---
         #ifdef _OPENMP
         #pragma omp parallel
         #endif
         {
-        std::vector<double> a(rows), b(rows), c(rows), d(rows), x(rows), cp(rows), dp(rows);
-
-        // --- sweep 2: implicit along y, one system per column ---
+        std::vector<double> dp(rows), x(rows);
         #ifdef _OPENMP
         #pragma omp for schedule(runtime)
         #endif
         for (int j = 0; j < cols; ++j) {
+            const size_t base = static_cast<size_t>(j) * rows;
             for (int i = 0; i < rows; ++i) {
+                const size_t k = base + i;
+                double d;
                 if (pinned[i][j]) {
-                    a[i] = 0.0; b[i] = 1.0; c[i] = 0.0;
-                    d[i] = grid[i][j];
-                    continue;
-                }
-                const double aW = (j > 0)        ? faceAlpha(i, j, i, j - 1) : 0.0;
-                const double aE = (j < cols - 1) ? faceAlpha(i, j, i, j + 1) : 0.0;
-                const double aN = (i > 0)        ? faceAlpha(i, j, i - 1, j) : 0.0;
-                const double aS = (i < rows - 1) ? faceAlpha(i, j, i + 1, j) : 0.0;
-
-                a[i] = -rc * aN;
-                b[i] = 1.0 + rc * (aN + aS);
-                c[i] = -rc * aS;
-
-                if (crankNicolson) {
+                    d = grid[i][j];
+                } else if (crankNicolson) {
                     double xFlux = 0.0;
-                    if (j > 0)        xFlux += aW * (adiMid[i][j - 1] - adiMid[i][j]);
-                    if (j < cols - 1) xFlux += aE * (adiMid[i][j + 1] - adiMid[i][j]);
-                    d[i] = adiMid[i][j] + rc * xFlux;
+                    if (j > 0)        xFlux += aW2[k] * (adiMid[i][j - 1] - adiMid[i][j]);
+                    if (j < cols - 1) xFlux += aE2[k] * (adiMid[i][j + 1] - adiMid[i][j]);
+                    d = adiMid[i][j] + rc * xFlux;
                 } else {
+                    const size_t k1 = static_cast<size_t>(i) * cols + j;
                     double yFlux = 0.0;
-                    if (i > 0)        yFlux += aN * (grid[i - 1][j] - grid[i][j]);
-                    if (i < rows - 1) yFlux += aS * (grid[i + 1][j] - grid[i][j]);
-                    d[i] = adiMid[i][j] - rc * yFlux;
+                    if (i > 0)        yFlux += aN1[k1] * (grid[i - 1][j] - grid[i][j]);
+                    if (i < rows - 1) yFlux += aS1[k1] * (grid[i + 1][j] - grid[i][j]);
+                    d = adiMid[i][j] - rc * yFlux;
                 }
+                dp[i] = (i == 0) ? d / m2[k] : (d - a2[k] * dp[i - 1]) / m2[k];
             }
-            thomas(a, b, c, d, x, cp, dp);
+            x[rows - 1] = dp[rows - 1];
+            for (int i = rows - 2; i >= 0; --i) x[i] = dp[i] - cp2[base + i] * x[i + 1];
             for (int i = 0; i < rows; ++i) adiOut[i][j] = x[i];
         }
         } // end parallel region for sweep 2
@@ -386,6 +442,11 @@ private:
     std::vector<std::vector<double>> adiOut;
     std::vector<std::vector<char>> pinned;
     bool pinnedDirty = true;
+    //precompute ADI systems (see buildAPI)
+    std::vector<double> a1, cp1, m1, aN1, aS1, a2, cp2, m2, aW2, aE2;
+    std::vector<char> pin1;
+    double adiRc = 0.0, adiBuiltDt = -1.0;
+    bool adiBuiltCN = false, adiDirty = true;
     std::vector<PointSource> pointSources;
 };
 

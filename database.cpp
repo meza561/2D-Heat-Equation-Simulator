@@ -1,5 +1,6 @@
 #include "database.hpp"
 #include <iostream>
+#include <algorithm>
 
 HeatDatabase::HeatDatabase(const std::string& dbName)
     : db(nullptr), insertStmt(nullptr), dbName(dbName), inTransaction(false) {}
@@ -53,19 +54,18 @@ bool HeatDatabase::init() {
     exec("PRAGMA temp_store=MEMORY;");
     exec("PRAGMA cache_size=-65536;");   // 64 MB page cache
 
-    // WITHOUT ROWID: (step, x, y) is the entire key, so there is no reason to
-    // carry a separate rowid B-tree plus a unique index over the same columns.
-    // This roughly halves the on-disk footprint per sample.
-    const char* sql = "CREATE TABLE IF NOT EXISTS HeatMap ("
-                      "step INTEGER NOT NULL, "
-                      "x INTEGER NOT NULL, "
-                      "y INTEGER NOT NULL, "
-                      "temp REAL NOT NULL, "
-                      "PRIMARY KEY (step, x, y)) WITHOUT ROWID;";
+    // One row per saved frame: the whole grid packed row-major as doubles in
+    // a single BLOB. Storing one row per cell meant rows*cols B-tree inserts
+    // per frame (90,000 at 300x300), which was most of the runtime.
+    const char* sql = "CREATE TABLE IF NOT EXISTS Frames ("
+                      "step INTEGER PRIMARY KEY, "
+                      "rows INTEGER NOT NULL, "
+                      "cols INTEGER NOT NULL, "
+                      "data BLOB NOT NULL);";
     if (!exec(sql)) return false;
 
     // Prepared once and reused for every sample of every timestep.
-    const char* ins = "INSERT OR REPLACE INTO HeatMap (step, x, y, temp) VALUES (?, ?, ?, ?);";
+    const char* ins = "INSERT OR REPLACE INTO Frames (step, rows, cols, data) VALUES (?, ?, ?, ?);";
     if (sqlite3_prepare_v2(db, ins, -1, &insertStmt, nullptr) != SQLITE_OK) {
         std::cerr << "Failed to prepare insert: " << sqlite3_errmsg(db) << std::endl;
         return false;
@@ -80,7 +80,7 @@ bool HeatDatabase::beginRun() {
     // smoke test and by-hand runs do exactly that - and there the next run
     // would accumulate the previous one's rows and collide with them on the
     // (step, x, y) primary key.
-    if (!exec("DELETE FROM HeatMap;")) return false;
+    if (!exec("DELETE FROM Frames;")) return false;
     if (!exec("BEGIN TRANSACTION;")) return false;
     inTransaction = true;
     return true;
@@ -89,24 +89,30 @@ bool HeatDatabase::beginRun() {
 bool HeatDatabase::saveTimestep(int step, const std::vector<std::vector<double>>& grid) {
     if (!insertStmt) return false;
 
-    for (size_t i = 0; i < grid.size(); ++i) {
-        for (size_t j = 0; j < grid[i].size(); ++j) {
-            sqlite3_bind_int(insertStmt, 1, step);
-            sqlite3_bind_int(insertStmt, 2, static_cast<int>(i));
-            sqlite3_bind_int(insertStmt, 3, static_cast<int>(j));
-            sqlite3_bind_double(insertStmt, 4, grid[i][j]);
+    const int rows = static_cast<int>(grid.size());
+    const int cols = rows > 0 ? static_cast<int>(grid[0].size()) : 0;
 
-            if (sqlite3_step(insertStmt) != SQLITE_DONE) {
-                std::cerr << "Insert failed at step " << step << " ("
-                          << i << "," << j << "): "
-                          << sqlite3_errmsg(db) << std::endl;
-                sqlite3_reset(insertStmt);
-                return false;
-            }
-            sqlite3_reset(insertStmt);
-        }
+    // Flatten into one contiguous buffer, reused across calls.
+    frameBuf.resize(static_cast<size_t>(rows) * cols);
+    for (int i = 0; i < rows; ++i) {
+        std::copy(grid[i].begin(), grid[i].end(),
+                  frameBuf.begin() + static_cast<size_t>(i) * cols);
     }
-    return true;
+
+    sqlite3_bind_int(insertStmt, 1, step);
+    sqlite3_bind_int(insertStmt, 2, rows);
+    sqlite3_bind_int(insertStmt, 3, cols);
+    sqlite3_bind_blob(insertStmt, 4, frameBuf.data(),
+                      static_cast<int>(frameBuf.size() * sizeof(double)),
+                      SQLITE_STATIC);
+
+    bool ok = sqlite3_step(insertStmt) == SQLITE_DONE;
+    if (!ok) {
+        std::cerr << "Insert failed at step " << step << ": "
+                  << sqlite3_errmsg(db) << std::endl;
+    }
+    sqlite3_reset(insertStmt);
+    return ok;
 }
 
 bool HeatDatabase::endRun() {
