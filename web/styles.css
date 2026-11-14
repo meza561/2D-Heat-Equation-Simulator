@@ -10,10 +10,7 @@
 *, *::before, *::after {
     box-sizing: border-box;
 }
-<<<<<<< HEAD
-=======
 
->>>>>>> 5983d8898d77a6b4560578664dbd1d5d1823476d
 :root {
     --primary-emerald: #064E3B;
     --primary-emerald-hover: #043a2b;

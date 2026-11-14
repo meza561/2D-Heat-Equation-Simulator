@@ -42,3 +42,4 @@ tests/ui/playwright-report/
 tests/ui/playwright/.cache/
 graphify-out/
 node_modules/
+Claude outputs/

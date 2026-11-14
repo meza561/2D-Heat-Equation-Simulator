@@ -599,5 +599,5 @@ discrete maximum principle (no interior extremum).
 - `make_figures.py`: renders the report figures from the study output.
 - `start.sh`: Unified launch script.
 - `run_study.sh`: builds and runs the study, then renders figures.
-- ## License
+## License
 MIT © 2026 Noah Meza. See [LICENSE](LICENSE).
