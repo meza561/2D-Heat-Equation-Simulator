@@ -74,10 +74,12 @@ bool HeatDatabase::init() {
 }
 
 bool HeatDatabase::beginRun() {
-    // Only the most recent run is ever served to the UI (the frontend keeps its
-    // own run history in localStorage), so previous runs are dropped rather
-    // than accumulated. Without this the table grows without bound, and
-    // same-sized re-runs collide on the primary key.
+    // Load-bearing only on the shared-database path. Given --run-id, every run
+    // opens its own fresh runs/<id>.db and this finds nothing to delete.
+    // Without one the binary reuses heat_sim.db across invocations - the CI
+    // smoke test and by-hand runs do exactly that - and there the next run
+    // would accumulate the previous one's rows and collide with them on the
+    // (step, x, y) primary key.
     if (!exec("DELETE FROM HeatMap;")) return false;
     if (!exec("BEGIN TRANSACTION;")) return false;
     inTransaction = true;

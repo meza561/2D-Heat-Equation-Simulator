@@ -4,6 +4,9 @@ heat_study
 build/
 cmake-build-debug/
 
+# Local environment (.env.example is the committed template)
+.env
+
 # Python Virtual Environment
 .venv/
 venv/
@@ -15,6 +18,7 @@ __pycache__/
 server.log
 .server.pid
 latest_heatmap.json
+runs/
 *.db
 *.db-wal
 *.db-shm
@@ -36,3 +40,5 @@ tests/ui/node_modules/
 tests/ui/test-results/
 tests/ui/playwright-report/
 tests/ui/playwright/.cache/
+graphify-out/
+node_modules/

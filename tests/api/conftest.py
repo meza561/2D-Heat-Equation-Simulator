@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import sys
+import uuid
 
 import pytest
 
@@ -20,15 +21,25 @@ def client(tmp_path, monkeypatch):
     having to monkeypatch the module's constants.
     """
     monkeypatch.chdir(tmp_path)
+    # The limiter counts per IP in process memory, so every test shares one
+    # counter and would eventually exhaust it. Off unless a test asks for it.
+    monkeypatch.setattr(server.limiter, 'enabled', False)
     return server.app.test_client()
 
 
-def seed_db(frames, path='heat_sim.db'):
-    """Write frames as {step: [[temp, ...], ...]} into a HeatMap table.
+# A valid uuid4 hex, for tests that need a run id the server will accept.
+RUN_ID = uuid.uuid4().hex
+OTHER_RUN_ID = uuid.uuid4().hex
+
+
+def seed_db(frames, run_id=RUN_ID):
+    """Write frames as {step: [[temp, ...], ...]} into one run's database.
 
     Same schema database.cpp creates: (step, x, y) as the whole primary key,
     with x the row index and y the column index.
     """
+    os.makedirs('runs', exist_ok=True)
+    path = os.path.join('runs', f'{run_id}.db')
     conn = sqlite3.connect(path)
     conn.execute('CREATE TABLE HeatMap ('
                  'step INTEGER NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL, '

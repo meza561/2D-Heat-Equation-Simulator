@@ -7,14 +7,29 @@
 #include <utility>
 #include <algorithm>
 #include <sstream>
+#include <filesystem>
+#include <system_error>
+#include <limits>
 #include "database.hpp"
 #include "simulation.hpp"
 #include "reaction.hpp"
+#include "wave.hpp"
+#include "schrodinger.hpp"
 
+/**
+ * @param rangeMin,rangeMax  the field's range over the whole run, when the
+ *        caller tracked it. NaN means "take it from this grid", which is right
+ *        for the heat modes: they march toward a steady state bracketed by the
+ *        boundary data, so the final frame already spans the run. A wave does
+ *        the opposite - it peaks at t = 0 and spreads out - so its final frame
+ *        understates the range, and the frontend would rescale mid-timeline.
+ */
 void exportToJSON(const std::string& filename, int step, int rows, int cols,
                   const std::vector<std::vector<double>>& grid,
                   double dt, int saveInterval,
-                  const std::string& scheme, double diffusionNumber) {
+                  const std::string& scheme, double diffusionNumber,
+                  double rangeMin = std::numeric_limits<double>::quiet_NaN(),
+                  double rangeMax = std::numeric_limits<double>::quiet_NaN()) {
     std::ofstream file(filename);
     file << "{\n";
     file << "  \"step\": " << step << ",\n";
@@ -25,6 +40,21 @@ void exportToJSON(const std::string& filename, int step, int rows, int cols,
     file << "  \"saveInterval\": " << saveInterval << ",\n";
     file << "  \"scheme\": \"" << scheme << "\",\n";
     file << "  \"F\": " << diffusionNumber << ",\n";
+    // The field's actual range. The heat modes happen to run between the
+    // boundary temperatures, but wave amplitude is signed and centred on zero,
+    // so a consumer cannot assume a 0-100 scale and read it correctly. Stating
+    // the measured range lets the frontend pick a symmetric diverging scale
+    // for a signed field without having to know which mode produced it.
+    double dataMin = grid.empty() ? 0.0 : grid[0][0];
+    double dataMax = dataMin;
+    for (const auto& row : grid)
+        for (double v : row) { dataMin = std::min(dataMin, v); dataMax = std::max(dataMax, v); }
+    if (std::isfinite(rangeMin) && std::isfinite(rangeMax)) {
+        dataMin = std::min(dataMin, rangeMin);
+        dataMax = std::max(dataMax, rangeMax);
+    }
+    file << "  \"min\": " << std::setprecision(10) << dataMin << ",\n";
+    file << "  \"max\": " << std::setprecision(10) << dataMax << ",\n";
     file << "  \"data\": [\n";
     for (int i = 0; i < rows; ++i) {
         file << "    [";
@@ -43,21 +73,39 @@ struct MaterialRegion { int r0, c0, r1, c1; double alpha; };
 struct Options {
     bool insTop = false, insBottom = false, insLeft = false, insRight = false;
     std::vector<MaterialRegion> materials;
+    std::string runId;
 };
+
+/** A run id has to be safe to drop straight into a path. Exactly the 32
+ *  lowercase hex characters of a uuid4, so no separators and nothing that can
+ *  climb out of runs/. */
+bool validRunId(const std::string& id) {
+    if (id.size() != 32) return false;
+    for (char c : id) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
 
 /**
  * Pull `--key=value` options out of argv and return the remaining positional
  * arguments. Keeping these flag-style avoids adding more positional slots to
- * an already long fixed layout, and leaves the existing ordering untouched.
+ * an already long fixed layout, and leaves the existing ordering untouched -
+ * which matters for --run-id in particular, since the reaction-diffusion modes
+ * already read their own parameters from the trailing positional slots.
  *
  *   --insulate=tblr                      edges held at zero flux
  *   --material=r0,c0,r1,c1,alpha         repeatable; a rectangle of diffusivity
+ *   --run-id=<32 hex>                    write runs/<id>.{db,json} instead of
+ *                                        the shared heat_sim.db
  */
 std::vector<std::string> extractOptions(int argc, char* argv[], Options& opt) {
     std::vector<std::string> positional;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a.rfind("--insulate=", 0) == 0) {
+        if (a.rfind("--run-id=", 0) == 0) {
+            opt.runId = a.substr(9);
+        } else if (a.rfind("--insulate=", 0) == 0) {
             const std::string e = a.substr(11);
             opt.insTop    = e.find('t') != std::string::npos;
             opt.insBottom = e.find('b') != std::string::npos;
@@ -83,6 +131,27 @@ std::vector<std::string> extractOptions(int argc, char* argv[], Options& opt) {
 int main(int argcRaw, char* argvRaw[]) {
     Options opt;
     std::vector<std::string> args = extractOptions(argcRaw, argvRaw, opt);
+
+    // Per-run output files. Without --run-id the binary keeps writing the
+    // shared pair it always has, so running it by hand (and the CI smoke test)
+    // still works; the server always passes one, which is what lets two runs
+    // proceed without touching each other's data.
+    std::string dbPath = "heat_sim.db";
+    std::string jsonPath = "latest_heatmap.json";
+    if (!opt.runId.empty()) {
+        if (!validRunId(opt.runId)) {
+            std::cerr << "Invalid --run-id: expected 32 lowercase hex characters\n";
+            return 1;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories("runs", ec);
+        if (ec) {
+            std::cerr << "Could not create runs/: " << ec.message() << "\n";
+            return 1;
+        }
+        dbPath = "runs/" + opt.runId + ".db";
+        jsonPath = "runs/" + opt.runId + ".json";
+    }
     const int argc = static_cast<int>(args.size());
     std::vector<char*> argvStore;
     for (auto& s : args) argvStore.push_back(const_cast<char*>(s.c_str()));
@@ -124,10 +193,17 @@ int main(int argcRaw, char* argvRaw[]) {
         // Diffusion number. The explicit scheme is only stable up to 0.25;
         // the implicit schemes accept any positive value.
         if (argc >= 10) F_TARGET = std::stod(argv[9]);
-        for (int k = 10; k + 2 < argc; k += 3) {
-            sources.push_back({ std::stoi(argv[k]),
-                                std::stoi(argv[k + 1]),
-                                std::stod(argv[k + 2]) });
+        // The trailing slots are heat sources only for the heat modes. The
+        // other models read their own parameters from the same positions, and
+        // wave's boundary type is a word ("fixed"/"free"), so parsing it as a
+        // source coordinate throws rather than quietly producing junk.
+        if (mode != "wave" && mode != "schrodinger"
+            && mode != "fisher" && mode != "gray-scott") {
+            for (int k = 10; k + 2 < argc; k += 3) {
+                sources.push_back({ std::stoi(argv[k]),
+                                    std::stoi(argv[k + 1]),
+                                    std::stod(argv[k + 2]) });
+            }
         }
     }
 
@@ -156,15 +232,22 @@ int main(int argcRaw, char* argvRaw[]) {
         methodName = "Crank-Nicolson (ADI)";
     }
 
-    if (method == HeatSimulation::Method::Explicit && F_TARGET > 0.25) {
+    const bool isWave = (mode == "wave");
+    const bool isSchrodinger = (mode == "schrodinger");
+    const bool isReactionDiffusion = (mode == "fisher" || mode == "gray-scott");
+
+    // F is the heat solver's diffusion number. The wave and reaction-diffusion
+    // models derive their own step size and ignore it, so warning about it
+    // there would be describing a limit that does not apply to the run.
+    if (method == HeatSimulation::Method::Explicit && F_TARGET > 0.25
+            && !isWave && !isSchrodinger && !isReactionDiffusion) {
         std::cout << "Warning: F = " << F_TARGET
                   << " exceeds the explicit stability limit of 0.25; "
                      "the solution will diverge.\n";
     }
 
     DT = F_TARGET * DX * DX / ALPHA;
-    const bool isReactionDiffusion = (mode == "fisher" || mode == "gray-scott");
-    if (!isReactionDiffusion) {
+    if (!isReactionDiffusion && !isWave && !isSchrodinger) {
         if (mode != "pde") {
             std::cout << "Scheme: " << methodName << "\n";
         }
@@ -183,7 +266,7 @@ int main(int argcRaw, char* argvRaw[]) {
     if (cells * frames > SAMPLE_BUDGET) {
         long long scale = (cells * frames + SAMPLE_BUDGET - 1) / SAMPLE_BUDGET;
         SAVE_INTERVAL *= static_cast<int>(scale);
-        if (!isReactionDiffusion) {   // RD sets its own frame budget below
+        if (!isReactionDiffusion && !isWave && !isSchrodinger) {   // those set their own frame budget below
             std::cout << "Large grid (" << ROWS << "x" << COLS
                       << "): saving every " << SAVE_INTERVAL << " steps\n";
         }
@@ -216,11 +299,210 @@ int main(int argcRaw, char* argvRaw[]) {
                   << (opt.insTop ? " top" : "") << (opt.insBottom ? " bottom" : "")
                   << (opt.insLeft ? " left" : "") << (opt.insRight ? " right" : "") << "\n";
     }
-    HeatDatabase db("heat_sim.db");
+    HeatDatabase db(dbPath);
 
     if (!db.init()) return 1;
 
-    if (mode == "fisher" || mode == "gray-scott") {
+    if (mode == "schrodinger") {
+        // ---- Schrodinger equation --------------------------------------
+        // i psi_t = -1/2 lap(psi) + V psi. Crank-Nicolson via a Cayley
+        // transform in each direction; see schrodinger.hpp for why an
+        // explicit scheme is not an option here.
+        //
+        // The exported field is |psi|^2, the probability density. It is
+        // non-negative, so it travels the same 0..max export path the heat
+        // modes use rather than wave's symmetric signed range.
+        //
+        // Only |psi|^2 is stored. The phase is discarded, which is what makes
+        // that reuse possible; interference still shows up, because it has
+        // already happened in psi by the time the modulus is taken. Storing
+        // the phase (or u and v separately) would allow colouring by phase
+        // and is the obvious future extension - it needs a second field in
+        // the database schema and in the JSON, so it is deliberately not
+        // done here.
+        const std::string potArg = (argc > 10) ? argv[10] : "free";
+        int qSteps = (argc > 11) ? std::stoi(argv[11]) : 1200;
+        if (qSteps < 1) qSteps = 1;
+        if (qSteps > 200000) qSteps = 200000;
+
+        using Q = SchrodingerSimulation;
+        Q::Potential pot = Q::Potential::Free;
+        std::string potName = "free particle";
+        if (potArg == "well" || potArg == "square-well") {
+            pot = Q::Potential::SquareWell;
+            potName = "infinite square well";
+        } else if (potArg == "harmonic") {
+            pot = Q::Potential::Harmonic;
+            potName = "harmonic oscillator";
+        }
+
+        // dx = 1 grid unit, as the wave solver does. Crank-Nicolson is
+        // unconditionally stable, so dt is set by what makes the animation
+        // read rather than by a stability limit: the packet should cross the
+        // box, or the oscillator complete a couple of periods, over the run.
+        const double qDx = 1.0;
+        const double span = std::min(ROWS, COLS) * qDx;
+        const double sigma0 = span / 17.0;          // a few percent of the box
+        // omega is fixed by the width the box can show: a well too tight to
+        // resolve on the grid, or too loose to fit inside it, is no use.
+        const double omega = 1.0 / (2.0 * sigma0 * sigma0);
+
+        // Crank-Nicolson is unconditionally stable, so dt is set by what the
+        // SAVED FRAMES have to resolve rather than by a limit. The harmonic
+        // run is periodic, so its step is tied to the period: at a flat
+        // dt = 1 a 20x20 run covered 69 periods in 150 frames, landing
+        // consecutive frames ~0.46 of a period apart, and a real oscillation
+        // aliased into jitter about the centre. 200 steps per period leaves
+        // ~25 frames per period once saveEvery has thinned them.
+        const double qPeriod = 2.0 * M_PI / omega;
+        const double qDt = (pot == Q::Potential::Harmonic) ? qPeriod / 200.0 : 0.2;
+
+        Q q(ROWS, COLS, qDx, qDt);
+        q.setPotential(pot, omega);
+
+        if (pot == Q::Potential::Harmonic) {
+            // A coherent state: the ground-state Gaussian, displaced. It
+            // oscillates across the well at frequency omega WITHOUT
+            // spreading, which is the one bound-state behaviour with no
+            // classical analogue worth watching.
+            q.seedGaussian(-span / 5.0, 0.0, q.groundStateSigma());
+            std::cout << "Schrodinger: " << potName << ", omega=" << omega
+                      << ", period " << (2.0 * M_PI / omega) << "\n";
+        } else {
+            // A packet with momentum, so it travels as well as spreads. In
+            // the well the walls are the point: it reflects and interferes
+            // with itself. Free means the same box, with the packet meant to
+            // stay clear of the walls for as long as it can.
+            q.seedGaussian(-span / 4.0, 0.0, sigma0, 0.5, 0.0);
+            std::cout << "Schrodinger: " << potName << ", sigma0=" << sigma0
+                      << ", momentum k=0.5\n";
+        }
+        std::cout << "dt = " << qDt << " (Crank-Nicolson is unconditionally "
+                     "stable, so this is an accuracy choice)\n";
+
+        int saveEvery = std::max(1, qSteps / 150);
+        const long long qCells = static_cast<long long>(ROWS) * COLS;
+        const long long Q_BUDGET = 3000000LL;
+        while ((qSteps / saveEvery + 1) * qCells > Q_BUDGET) saveEvery *= 2;
+        std::cout << "Running " << qSteps << " steps, saving every "
+                  << saveEvery << "\n";
+
+        if (!db.beginRun()) return 1;
+        // |psi|^2 peaks at t = 0 for a spreading packet and falls thereafter,
+        // so the final frame understates the run's range. Track it, exactly
+        // as the wave solver does, or the frontend rescales mid-timeline.
+        double qMin = 0.0, qMax = 0.0;
+        auto trackRange = [&](const Q::Grid& g) {
+            for (const auto& row : g)
+                for (double v : row) { qMin = std::min(qMin, v); qMax = std::max(qMax, v); }
+        };
+        db.saveTimestep(0, q.field());
+        trackRange(q.field());
+        const double p0 = q.totalProbability();
+        for (int s = 1; s <= qSteps; ++s) {
+            q.step();
+            if (s % saveEvery == 0 || s == qSteps) {
+                db.saveTimestep(s, q.field());
+                trackRange(q.field());
+            }
+        }
+        if (!db.endRun()) return 1;
+
+        // Unitarity is the one property worth reporting: if this has drifted,
+        // the run is not quantum mechanics and the picture is meaningless.
+        std::cout << "Total probability: " << std::setprecision(12) << p0
+                  << " -> " << q.totalProbability() << "\n";
+
+        exportToJSON(jsonPath, qSteps, ROWS, COLS, q.field(),
+                     qDt, saveEvery, "Schrodinger (Crank-Nicolson)", F_TARGET,
+                     qMin, qMax);
+        std::cout << "Simulation complete. Output written to " << jsonPath << "\n";
+        return 0;
+
+    } else if (mode == "wave") {
+        // ---- Wave equation ---------------------------------------------
+        // u_tt = c^2 lap(u). Second order in time, so the solver carries two
+        // time levels; see wave.hpp. Nothing here converges - a clamped
+        // membrane oscillates forever - so the run is a fixed step count
+        // rather than a convergence loop.
+        const double cWave = (argc > 10) ? std::stod(argv[10]) : 1.0;
+        const std::string bcArg = (argc > 11) ? argv[11] : "fixed";
+        int waveSteps = (argc > 12) ? std::stoi(argv[12]) : 1200;
+        const std::string icArg = (argc > 13) ? argv[13] : "pluck";
+
+        const double c = (cWave > 0.0 && cWave <= 1e3) ? cWave : 1.0;
+        const bool freeEdges = (bcArg == "free");
+        if (waveSteps < 1) waveSteps = 1;
+        if (waveSteps > 200000) waveSteps = 200000;
+
+        // dt comes from the CFL limit, exactly as the heat solver derives dt
+        // from F. A Courant number of 0.5 leaves comfortable margin under the
+        // 2D limit of 1/sqrt(2) ~ 0.707.
+        //
+        // Because dt is tied to the limit, dt = nu dx / c shrinks as c grows,
+        // so c does not change how far the wave moves per frame - it sets the
+        // physical time the run spans, the same way alpha does for heat. The
+        // reported dt is what makes the time axis correct.
+        const double NU = 0.5;
+        const double waveDx = 1.0;
+        const double waveDt = NU * waveDx / c;
+
+        WaveSimulation w(ROWS, COLS, c, waveDx, waveDt);
+        w.setBoundaryCondition(freeEdges ? WaveSimulation::Boundary::Free
+                                         : WaveSimulation::Boundary::Fixed);
+        if (icArg == "impulse") {
+            w.impulse(ROWS / 2, COLS / 2, 1.0);
+        } else {
+            // Radius scales with the grid so the pluck stays a feature of the
+            // domain rather than of the resolution.
+            w.pluckSmooth(ROWS / 2, COLS / 2, std::max(2, std::min(ROWS, COLS) / 8), 1.0);
+        }
+
+        std::cout << "Wave: c=" << c << " dt=" << waveDt
+                  << " (Courant nu=" << NU << ", 2D limit "
+                  << WaveSimulation::cflLimit() << ")\n";
+        std::cout << "Edges: " << (freeEdges ? "free (Neumann, same-sign reflection)"
+                                             : "fixed (clamped, inverted reflection)") << "\n";
+
+        int saveEvery = std::max(1, waveSteps / 150);
+        const long long wCells = static_cast<long long>(ROWS) * COLS;
+        const long long W_BUDGET = 3000000LL;
+        while ((waveSteps / saveEvery + 1) * wCells > W_BUDGET) saveEvery *= 2;
+        std::cout << "Running " << waveSteps << " steps, saving every "
+                  << saveEvery << "\n";
+
+        if (!db.beginRun()) return 1;
+        double waveMin = 0.0, waveMax = 0.0;
+        auto trackRange = [&](const WaveSimulation::Grid& g) {
+            for (const auto& row : g)
+                for (double v : row) { waveMin = std::min(waveMin, v); waveMax = std::max(waveMax, v); }
+        };
+        db.saveTimestep(0, w.field());
+        trackRange(w.field());
+        for (int s = 1; s <= waveSteps; ++s) {
+            if (!w.step()) {
+                // Unreachable with the derived dt above, but the binary is
+                // callable by hand: report it rather than writing a field that
+                // silently stopped advancing.
+                std::cerr << "CFL violated (nu = " << w.courant() << " > "
+                          << WaveSimulation::cflLimit() << "); stopping at step "
+                          << s << "\n";
+                return 1;
+            }
+            if (s % saveEvery == 0 || s == waveSteps) {
+                db.saveTimestep(s, w.field());
+                trackRange(w.field());
+            }
+        }
+        if (!db.endRun()) return 1;
+
+        exportToJSON(jsonPath, waveSteps, ROWS, COLS, w.field(),
+                     waveDt, saveEvery, "wave (leapfrog)", F_TARGET,
+                     waveMin, waveMax);
+        std::cout << "Simulation complete. Output written to " << jsonPath << "\n";
+        return 0;
+
+    } else if (mode == "fisher" || mode == "gray-scott") {
         // ---- Reaction-diffusion ----------------------------------------
         // Same five-point Laplacian as the heat solver, plus a reaction term.
         const bool gs = (mode == "gray-scott");
@@ -297,9 +579,9 @@ int main(int argcRaw, char* argvRaw[]) {
         }
         if (!db.endRun()) return 1;
 
-        exportToJSON("latest_heatmap.json", rdSteps, ROWS, COLS, rd.field(),
+        exportToJSON(jsonPath, rdSteps, ROWS, COLS, rd.field(),
                      rdDt, saveEvery, rdName, F_TARGET);
-        std::cout << "Simulation complete. Output written to latest_heatmap.json\n";
+        std::cout << "Simulation complete. Output written to " << jsonPath << "\n";
         return 0;
 
     } else if (mode == "pde") {
@@ -308,7 +590,7 @@ int main(int argcRaw, char* argvRaw[]) {
         db.beginRun();
         db.saveTimestep(0, sim.getGrid());
         db.endRun();
-        exportToJSON("latest_heatmap.json", 0, ROWS, COLS, sim.getGrid(), DT, 1,
+        exportToJSON(jsonPath, 0, ROWS, COLS, sim.getGrid(), DT, 1,
                      "analytical", F_TARGET);
     } else {
         // An insulated edge carries no imposed temperature - writing one would
@@ -351,10 +633,10 @@ int main(int argcRaw, char* argvRaw[]) {
         }
 
         if (!db.endRun()) return 1;
-        exportToJSON("latest_heatmap.json", finalStep, ROWS, COLS, sim.getGrid(),
+        exportToJSON(jsonPath, finalStep, ROWS, COLS, sim.getGrid(),
                      DT, SAVE_INTERVAL, methodName, F_TARGET);
     }
 
-    std::cout << "Simulation complete. Output written to latest_heatmap.json\n";
+    std::cout << "Simulation complete. Output written to " << jsonPath << "\n";
     return 0;
 }

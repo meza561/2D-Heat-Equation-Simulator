@@ -1,23 +1,153 @@
 import os
+import re
 import subprocess
 import threading
+import time
 import json
-from flask import Flask, request, jsonify, send_from_directory
+import uuid
+from flask import Flask, Response, request, jsonify, render_template, send_from_directory
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_talisman import Talisman
+from werkzeug.middleware.proxy_fix import ProxyFix
 import sqlite3
 
-app = Flask(__name__)
-CORS(app)
+# web/ holds both the static assets and the two pages rendered as templates
+# (index.html needs SITE_URL in its Open Graph tags, 404.html is served by the
+# error handler), so it serves as the template folder too.
+app = Flask(__name__, template_folder='web')
 
-# The simulation writes to one fixed database and one fixed JSON file, so two
-# overlapping requests would interleave and corrupt each other's results.
+# Deployment settings. Everything has a local-dev default, so ./start.sh needs
+# no environment at all.
+IS_PROD = os.environ.get('FLASK_ENV', 'development') == 'production'
+ALLOWED_ORIGIN = os.environ.get('ALLOWED_ORIGIN', 'http://localhost:5000')
+# Public base URL for absolute links crawlers and social scrapers need.
+SITE_URL = os.environ.get('SITE_URL', 'http://localhost:5000').rstrip('/')
+
+# Analytics. Off unless ANALYTICS_SITE is set, so local dev and the test suites
+# never phone home. GoatCounter was picked specifically because it sets no
+# cookies and stores no per-visitor identifier - under GDPR/ePrivacy that is
+# what removes the need for a consent banner, since there is no terminal-device
+# storage to consent to and nothing to tie a hit back to a person.
+# This is a GoatCounter site code, not a domain: "noahmeza" means the hits go
+# to https://noahmeza.goatcounter.com.
+ANALYTICS_SITE = os.environ.get('ANALYTICS_SITE', '')
+# The script itself is served from GoatCounter's shared static host; only the
+# hit endpoint lives on the per-site subdomain.
+ANALYTICS_SCRIPT_HOST = 'https://gc.zgo.at'
+ANALYTICS_ORIGIN = f'https://{ANALYTICS_SITE}.goatcounter.com' if ANALYTICS_SITE else ''
+
+# The frontend is served from this same origin, so nothing needs cross-origin
+# access in normal use; this exists for the case where the UI is hosted
+# elsewhere. Scoped to the API rather than the whole app.
+CORS(app, resources={r"/(run|frames|study)": {"origins": [ALLOWED_ORIGIN]}})
+
+# Every POST /run spawns a solver process, so it is the one route worth
+# capping. SIM_LOCK already serialises the work itself; this stops a flood of
+# requests queueing up behind it. In-memory storage holds only while the app
+# runs as one process - see wsgi.py before raising the worker count.
+RUN_RATE_LIMIT = os.environ.get('RUN_RATE_LIMIT', '60 per minute')
+limiter = Limiter(get_remote_address, app=app, storage_uri='memory://')
+
+# Security headers. Everything here is served from this origin: the stylesheet,
+# the two scripts, the preview image. The one exception is the favicon, an
+# inline SVG data: URI, which is why img-src has to allow data:.
+Talisman(
+    app,
+    force_https=IS_PROD,          # off locally, so http://localhost still works
+    strict_transport_security=IS_PROD,
+    strict_transport_security_max_age=31536000,
+    session_cookie_secure=IS_PROD,
+    content_security_policy={
+        'default-src': "'self'",
+        # count.js reports each hit by assigning to an Image().src, so the
+        # per-site origin has to be an allowed image source as well, not just a
+        # connect- one.
+        'img-src': ["'self'", 'data:'] + ([ANALYTICS_ORIGIN] if ANALYTICS_SITE else []),
+        'style-src': "'self'",
+        # Widened only when analytics is enabled: the script comes from
+        # GoatCounter's static host and posts its hits to the site subdomain.
+        'script-src': ["'self'"] + ([ANALYTICS_SCRIPT_HOST, ANALYTICS_ORIGIN] if ANALYTICS_SITE else []),
+        'connect-src': ["'self'"] + ([ANALYTICS_SCRIPT_HOST, ANALYTICS_ORIGIN] if ANALYTICS_SITE else []),
+        'base-uri': "'none'",
+        'frame-ancestors': "'none'",
+        'form-action': "'self'",
+    },
+    referrer_policy='strict-origin-when-cross-origin',
+)
+
+if IS_PROD:
+    # Behind a TLS-terminating proxy the app only ever sees http, so without
+    # this force_https redirects forever. One proxy hop.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+
+@app.errorhandler(429)
+def rate_limited(e):
+    """JSON, not Flask's HTML error page: every caller here speaks JSON."""
+    return jsonify({
+        "status": "error",
+        "message": f"Rate limit exceeded ({e.description}). Try again shortly.",
+    }), 429
+
+# Runs no longer share output files (see RUNS_DIR below), so this is purely a
+# concurrency cap: solver processes are CPU-bound, and letting an unbounded
+# number start at once would thrash the box rather than corrupt anything.
 SIM_LOCK = threading.Lock()
 
 # Path to the compiled C++ binary
 SIM_BINARY = "./heat_sim"
 MAX_SOURCES = 32
 WEB_DIR = "./web"
-DB_NAME = "heat_sim.db"
+
+# Every run gets its own database and JSON output in here, named by run id.
+# That is what keeps two simultaneous runs from overwriting each other - the
+# single shared pair of files was the reason this had to stay one process.
+RUNS_DIR = "runs"
+RUN_RETENTION_HOURS = float(os.environ.get('RUN_RETENTION_HOURS', '24'))
+
+# A run id goes straight into a filename, so nothing but the 32 lowercase hex
+# characters of a uuid4 is allowed near the filesystem.
+_RUN_ID_RE = re.compile(r'\A[0-9a-f]{32}\Z')
+
+
+def _valid_run_id(run_id):
+    if not run_id or not _RUN_ID_RE.match(run_id):
+        return False
+    try:
+        return uuid.UUID(hex=run_id).version == 4
+    except ValueError:
+        return False
+
+
+def _run_path(run_id, ext):
+    return os.path.join(RUNS_DIR, f'{run_id}.{ext}')
+
+
+def sweep_old_runs():
+    """Drop run files past the retention window.
+
+    Without this runs/ grows for as long as the server lives: every run leaves
+    a database behind and nothing ever removes it.
+    """
+    cutoff = time.time() - RUN_RETENTION_HOURS * 3600
+    try:
+        names = os.listdir(RUNS_DIR)
+    except OSError:
+        return 0
+    removed = 0
+    for name in names:
+        path = os.path.join(RUNS_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            # Being swept by another process, or in use; it will come round
+            # again next time.
+            continue
+    return removed
 
 def _clamp(value, lo, hi, default):
     """Coerce a client-supplied dimension into a sane range."""
@@ -39,17 +169,42 @@ def _clamp_float(value, lo, hi, default):
     return max(lo, min(hi, v))
 
 
-def get_grid_from_db(step):
-    """Return the stored frame at or before `step`.
+MODES = ('fdm', 'be', 'cn', 'pde', 'fisher', 'gray-scott', 'wave',
+         'schrodinger')
+POTENTIALS = ('free', 'well', 'harmonic')
+
+
+def _unknown(field, value, allowed):
+    """400 for a value outside `allowed`, rather than substituting a default.
+
+    Silently coercing one is how a client that asks for something the server
+    does not have gets a successful response describing a different
+    simulation. That reads as working from the outside - status 'success',
+    a full grid, a plausible picture - right up until someone checks which
+    solver actually ran. A stale deploy answering a new client this way is
+    what this replaces.
+
+    The value is echoed back so the caller can see what was rejected, capped
+    because it arrives from the network.
+    """
+    return jsonify({
+        "status": "error",
+        "message": (f"Unknown {field} {str(value)[:40]!r}. "
+                    f"Expected one of: {', '.join(allowed)}"),
+    }), 400
+
+
+def get_grid_from_db(step, db_path):
+    """Return the stored frame at or before `step`, from one run's database.
 
     Timesteps are persisted at an interval (SAVE_INTERVAL in main.cpp), so an
     arbitrary requested step is snapped down to the nearest stored frame,
     falling back to the earliest frame available.
     """
-    if not os.path.exists(DB_NAME):
+    if not os.path.exists(db_path):
         return None
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(db_path)
     try:
         cursor = conn.cursor()
 
@@ -92,11 +247,48 @@ def get_grid_from_db(step):
 
 @app.route('/')
 def index():
-    return send_from_directory(WEB_DIR, 'index.html')
+    # Rendered rather than served flat, so the Open Graph and Twitter tags can
+    # carry an absolute SITE_URL without the domain being baked into the file.
+    return render_template('index.html', site_url=SITE_URL,
+                           analytics_site=ANALYTICS_SITE)
+
+@app.route('/robots.txt')
+def robots():
+    # The API routes hold no crawlable content; keeping them out saves crawl
+    # budget and avoids bots POSTing nothing useful at the solver.
+    body = ('User-agent: *\n'
+            'Allow: /\n'
+            'Disallow: /run\n'
+            'Disallow: /frames\n'
+            'Disallow: /study\n'
+            f'Sitemap: {SITE_URL}/sitemap.xml\n')
+    return Response(body, mimetype='text/plain')
+
+@app.route('/sitemap.xml')
+def sitemap():
+    # The simulator and its two legal pages. Everything else is an API route
+    # or an asset, neither of which belongs in a sitemap.
+    xml = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+           '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+           f'  <url><loc>{SITE_URL}/</loc><changefreq>monthly</changefreq></url>\n'
+           f'  <url><loc>{SITE_URL}/privacy.html</loc><changefreq>yearly</changefreq></url>\n'
+           f'  <url><loc>{SITE_URL}/terms.html</loc><changefreq>yearly</changefreq></url>\n'
+           '</urlset>\n')
+    return Response(xml, mimetype='application/xml')
 
 @app.route('/<path:path>')
 def static_files(path):
     return send_from_directory(WEB_DIR, path)
+
+
+@app.errorhandler(404)
+def not_found(e):
+    # The API's own 404s are returned directly by their routes; this catches
+    # everything else, which means a browser at a bad URL - so answer with the
+    # page, and keep JSON for anything under the API paths.
+    if request.path.startswith(('/run', '/frames', '/study')):
+        return jsonify({"status": "error", "message": "Not found"}), 404
+    return render_template('404.html'), 404
 
 @app.route('/study')
 def study():
@@ -120,17 +312,24 @@ def study():
 
 @app.route('/frames')
 def frames():
-    """The step numbers stored for the current run, in order.
+    """The step numbers stored for one run, in order.
 
     The UI slider indexes this list. Without it the client had to guess which
     steps exist from the save interval, round to whole seconds, and let the
     server snap to whatever was nearest - so the time it displayed was not
     quite the time of the frame it was showing.
     """
-    if not os.path.exists(DB_NAME):
+    run_id = request.args.get('run_id')
+    if not _valid_run_id(run_id):
+        return jsonify({"status": "error",
+                        "message": "A valid run_id is required"}), 400
+
+    db_path = _run_path(run_id, 'db')
+    if not os.path.exists(db_path):
+        # Expired from the retention window, or never existed.
         return jsonify({"steps": []})
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(db_path)
     try:
         cursor = conn.cursor()
         # Index-only scan of the (step, x, y) primary key.
@@ -145,6 +344,7 @@ def frames():
 
 
 @app.route('/run', methods=['POST'])
+@limiter.limit(lambda: RUN_RATE_LIMIT)
 def run_simulation():
     data = request.json
     try:
@@ -162,8 +362,8 @@ def run_simulation():
         mode = str(data.get('mode', 'fdm'))
         if mode == 'explicit':
             mode = 'fdm'
-        if mode not in ('fdm', 'be', 'cn', 'pde', 'fisher', 'gray-scott'):
-            mode = 'fdm'
+        if mode not in MODES:
+            return _unknown('mode', mode, MODES)
 
         # Diffusion number. The explicit scheme is only stable to 0.25, so it
         # is held there; the implicit schemes are unconditionally stable and
@@ -208,11 +408,44 @@ def run_simulation():
             row = (n_rows - 1) - y      # flip: y counts up from the bottom
             source_args.extend([str(row), str(x), str(t)])
 
+        # Every run writes its own runs/<run_id>.{db,json}, so two runs can be
+        # in flight without touching each other's data.
+        run_id = uuid.uuid4().hex
+        sweep_old_runs()
+
         # Execute the C++ binary
         cmd = [SIM_BINARY, rows, cols, top, bottom, left, right, mode, alpha,
                str(diffusion)]
 
-        if mode in ('fisher', 'gray-scott'):
+        if mode == 'wave':
+            # The wave solver takes its own trailing parameters instead of heat
+            # sources, the same way reaction-diffusion does. Boundary
+            # temperatures do not apply: a wave edge is either clamped to zero
+            # amplitude or free, not held at a value.
+            #
+            # dt is derived from the CFL limit inside the binary, so c cannot
+            # destabilise the run - it sets the physical time the run spans.
+            wave_c = _clamp_float(data.get('waveC', 1.0), 0.05, 100.0, 1.0)
+            wave_bc = 'free' if str(data.get('waveBoundary', 'fixed')) == 'free' else 'fixed'
+            wave_steps = _clamp(data.get('waveSteps', 1200), 1, 200000, 1200)
+            wave_ic = 'impulse' if str(data.get('waveIC', 'pluck')) == 'impulse' else 'pluck'
+            cmd.extend([str(wave_c), wave_bc, str(wave_steps), wave_ic])
+
+        elif mode == 'schrodinger':
+            # Same shape as wave: its own trailing parameters, and no boundary
+            # temperatures - the edges are hard walls holding psi = 0.
+            #
+            # The potential is a word that lands in argv, so it is matched
+            # against a whitelist rather than passed through. dt is chosen
+            # inside the binary; Crank-Nicolson has no stability limit, so
+            # there is no equivalent of F or the CFL number to expose.
+            potential = str(data.get('potential', 'free'))
+            if potential not in POTENTIALS:
+                return _unknown('potential', potential, POTENTIALS)
+            q_steps = _clamp(data.get('schrodingerSteps', 1200), 1, 200000, 1200)
+            cmd.extend([potential, str(q_steps)])
+
+        elif mode in ('fisher', 'gray-scott'):
             # Reaction-diffusion takes its own parameters instead of heat
             # sources; boundary temperatures do not apply (edges are zero-flux).
             steps = _clamp(data.get('rdSteps', 5000), 1, 200000, 5000)
@@ -254,15 +487,17 @@ def run_simulation():
                 r1 = (n_rows - 1) - min(y0, y1)
                 cmd.append('--material=%d,%d,%d,%d,%g' % (r0, min(x0, x1), r1, max(x0, x1), av))
             
+        cmd.append(f'--run-id={run_id}')
+
         try:
+            # The output files are now per-run, so this lock is no longer about
+            # protecting them - it caps concurrent solver processes, which are
+            # CPU-bound and would otherwise pile up.
             with SIM_LOCK:
                 result = subprocess.run(cmd, capture_output=True, text=True,
                                         check=True, timeout=300)
-                # Read inside the lock: the binary rewrites this same file on
-                # every run, so releasing first would let a concurrent request
-                # swap it out between the run and the read.
-                with open('latest_heatmap.json', 'r') as f:
-                    heatmap_data = json.load(f)
+            with open(_run_path(run_id, 'json'), 'r') as f:
+                heatmap_data = json.load(f)
         except subprocess.TimeoutExpired:
             msg = "Simulation timed out after 300s"
             print("ERROR:", msg, flush=True)
@@ -280,6 +515,7 @@ def run_simulation():
 
         return jsonify({
             "status": "success",
+            "run_id": run_id,
             "output": result.stdout,
             "data": heatmap_data
         })
@@ -292,14 +528,24 @@ def get_timestep():
         step = request.args.get('time', type=int)
         if step is None:
             return jsonify({"status": "error", "message": "Time parameter required"}), 400
-        
-        heatmap_data = get_grid_from_db(step)
+
+        run_id = request.args.get('run_id')
+        if not _valid_run_id(run_id):
+            return jsonify({"status": "error",
+                            "message": "A valid run_id is required"}), 400
+
+        heatmap_data = get_grid_from_db(step, _run_path(run_id, 'db'))
         if not heatmap_data:
             return jsonify({"status": "error", "message": "Timestep not found"}), 404
             
         return jsonify(heatmap_data)
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+# Sweep at import, which covers every way the app starts (gunicorn included);
+# POST /run sweeps again so a long-lived server does not accumulate.
+sweep_old_runs()
+
 
 if __name__ == '__main__':
     if not os.path.exists(SIM_BINARY):

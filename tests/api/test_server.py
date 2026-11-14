@@ -6,13 +6,15 @@ and a real browser, so nothing here needs the compiled binary. The Playwright
 suite in tests/ui exercises the same endpoints end to end.
 """
 import json
+import os
 import subprocess
+import time
 import types
 
 import pytest
 
 import server
-from conftest import seed_db
+from conftest import seed_db, RUN_ID, OTHER_RUN_ID
 
 
 # ---- clamping ---------------------------------------------------------
@@ -51,35 +53,37 @@ def test_clamp_float_keeps_infinity_distinct_from_nan():
 # ---- GET /frames ------------------------------------------------------
 
 def test_frames_without_a_database(client):
-    assert client.get('/frames').get_json() == {'steps': []}
+    # A run id that never produced files, or whose files have been swept.
+    assert client.get(f'/frames?run_id={RUN_ID}').get_json() == {'steps': []}
 
 
 def test_frames_lists_sorted_distinct_steps(client):
     seed_db({20: [[1.0]], 0: [[2.0]], 10: [[3.0]]})
-    assert client.get('/frames').get_json() == {'steps': [0, 10, 20]}
+    assert client.get(f'/frames?run_id={RUN_ID}').get_json() == {'steps': [0, 10, 20]}
 
 
 def test_frames_survives_a_database_with_no_table(client):
     # A file exists but the run never got as far as creating HeatMap.
-    open('heat_sim.db', 'wb').close()
-    assert client.get('/frames').get_json() == {'steps': []}
+    os.makedirs('runs', exist_ok=True)
+    open(f'runs/{RUN_ID}.db', 'wb').close()
+    assert client.get(f'/frames?run_id={RUN_ID}').get_json() == {'steps': []}
 
 
 # ---- GET /run?time= ---------------------------------------------------
 
 def test_get_run_requires_a_time(client):
-    res = client.get('/run')
+    res = client.get(f'/run?run_id={RUN_ID}')
     assert res.status_code == 400
     assert res.get_json()['message'] == 'Time parameter required'
 
 
 def test_get_run_rejects_a_non_integer_time(client):
     # Flask's type=int yields None for junk, same as a missing parameter.
-    assert client.get('/run?time=abc').status_code == 400
+    assert client.get(f'/run?time=abc&run_id={RUN_ID}').status_code == 400
 
 
 def test_get_run_without_stored_data(client):
-    assert client.get('/run?time=0').status_code == 404
+    assert client.get(f'/run?time=0&run_id={RUN_ID}').status_code == 404
 
 
 def test_get_run_snaps_down_to_the_nearest_stored_frame(client):
@@ -88,42 +92,51 @@ def test_get_run_snaps_down_to_the_nearest_stored_frame(client):
              10: [[10.0, 11.0, 12.0], [13.0, 14.0, 15.0]],
              20: [[20.0, 21.0, 22.0], [23.0, 24.0, 25.0]]})
 
-    body = client.get('/run?time=15').get_json()
+    body = client.get(f'/run?time=15&run_id={RUN_ID}').get_json()
     assert body['step'] == 10
     assert body['data'] == [[10.0, 11.0, 12.0], [13.0, 14.0, 15.0]]
     assert (body['rows'], body['cols']) == (2, 3)
 
     # An exact hit returns that frame, not the one before it.
-    assert client.get('/run?time=20').get_json()['step'] == 20
+    assert client.get(f'/run?time=20&run_id={RUN_ID}').get_json()['step'] == 20
 
 
 def test_get_run_falls_back_to_the_earliest_frame(client):
     # Nothing is stored at or before the requested step.
     seed_db({10: [[10.0]], 20: [[20.0]]})
-    assert client.get('/run?time=5').get_json()['step'] == 10
+    assert client.get(f'/run?time=5&run_id={RUN_ID}').get_json()['step'] == 10
 
 
 # ---- POST /run --------------------------------------------------------
 
+def positional(cmd):
+    """argv with the --flags removed, matching extractOptions in main.cpp."""
+    return [a for a in cmd if not a.startswith('--')]
+
+
 def fake_run(recorder):
-    """A subprocess.run stand-in that records argv instead of executing."""
+    """A subprocess.run stand-in that records argv instead of executing.
+
+    It writes the JSON output where --run-id says the real binary would, which
+    is the only way the route can find it: the id is generated inside the
+    handler, so a test cannot know it beforehand.
+    """
     def run(cmd, **kwargs):
         recorder.append(cmd)
+        run_id = next((a.split('=', 1)[1] for a in cmd
+                       if a.startswith('--run-id=')), None)
+        if run_id:
+            os.makedirs('runs', exist_ok=True)
+            with open(f'runs/{run_id}.json', 'w') as f:
+                json.dump({'step': 5, 'rows': 1, 'cols': 1, 'dt': 20.0,
+                           'saveInterval': 10, 'data': [[1.0]]}, f)
         return types.SimpleNamespace(stdout='done\n', stderr='', returncode=0)
     return run
-
-
-def write_heatmap():
-    """The output file the binary would have written, which the route reads."""
-    with open('latest_heatmap.json', 'w') as f:
-        json.dump({'step': 5, 'rows': 1, 'cols': 1, 'dt': 20.0,
-                   'saveInterval': 10, 'data': [[1.0]]}, f)
 
 
 def test_post_run_success(client, monkeypatch):
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
-    write_heatmap()
 
     res = client.post('/run', json={'rows': 20, 'cols': 20, 'mode': 'fdm'})
     assert res.status_code == 200
@@ -174,12 +187,191 @@ def test_post_run_falls_back_to_the_exit_status(client, monkeypatch):
     assert 'exit status 3' in client.post('/run', json={}).get_json()['message']
 
 
+# ---- per-run isolation ------------------------------------------------
+
+def test_post_run_returns_a_run_id_and_passes_it_to_the_binary(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    run_id = client.post('/run', json={'mode': 'fdm'}).get_json()['run_id']
+
+    assert server._valid_run_id(run_id)
+    assert f'--run-id={run_id}' in calls[0]
+
+
+def test_two_runs_do_not_share_frames(client, monkeypatch):
+    # The whole point of the change: one run's timeline cannot show another's
+    # data, which is what the single shared heat_sim.db made unavoidable.
+    seed_db({0: [[1.0]], 10: [[2.0]]}, run_id=RUN_ID)
+    seed_db({0: [[3.0]], 5: [[4.0]], 9: [[5.0]]}, run_id=OTHER_RUN_ID)
+
+    assert client.get(f'/frames?run_id={RUN_ID}').get_json()['steps'] == [0, 10]
+    assert client.get(f'/frames?run_id={OTHER_RUN_ID}').get_json()['steps'] == [0, 5, 9]
+    assert client.get(f'/run?time=10&run_id={RUN_ID}').get_json()['data'] == [[2.0]]
+    assert client.get(f'/run?time=9&run_id={OTHER_RUN_ID}').get_json()['data'] == [[5.0]]
+
+
+@pytest.mark.parametrize('bad', [
+    '',                                    # missing
+    'not-a-uuid',
+    '../../etc/passwd',                    # the reason this is validated
+    'runs/x',
+    'ABCDEF0123456789ABCDEF0123456789',    # uppercase
+    '0123456789abcdef0123456789abcde',     # 31 chars
+    '10000000100010008000100000000000',    # well-formed hex, but version 1
+])
+def test_invalid_run_id_is_rejected(client, bad):
+    for url in (f'/frames?run_id={bad}', f'/run?time=0&run_id={bad}'):
+        res = client.get(url)
+        assert res.status_code == 400, url
+        assert res.get_json()['status'] == 'error'
+
+
+def test_run_id_is_required(client):
+    assert client.get('/frames').status_code == 400
+    assert client.get('/run?time=0').status_code == 400
+
+
+def test_a_traversing_run_id_never_reaches_the_filesystem(client, monkeypatch):
+    # Belt and braces: even if validation were bypassed, prove no read is
+    # attempted outside runs/.
+    opened = []
+    real_connect = server.sqlite3.connect
+    monkeypatch.setattr(server.sqlite3, 'connect',
+                        lambda p, *a, **k: (opened.append(p), real_connect(p, *a, **k))[1])
+
+    client.get('/frames?run_id=../../../etc/passwd')
+    assert opened == []
+
+
+# ---- retention sweep --------------------------------------------------
+
+def test_sweep_removes_only_expired_runs(client, monkeypatch):
+    os.makedirs('runs', exist_ok=True)
+    fresh = f'runs/{RUN_ID}.db'
+    stale = f'runs/{OTHER_RUN_ID}.db'
+    for path in (fresh, stale):
+        open(path, 'wb').close()
+
+    # Older than the window; os.utime is how we age it without waiting.
+    old = time.time() - (server.RUN_RETENTION_HOURS * 3600) - 60
+    os.utime(stale, (old, old))
+
+    assert server.sweep_old_runs() == 1
+    assert os.path.exists(fresh)
+    assert not os.path.exists(stale)
+
+
+def test_sweep_is_quiet_when_there_is_nothing_to_sweep(client):
+    # No runs/ directory at all, as on a fresh checkout.
+    assert server.sweep_old_runs() == 0
+
+
+# ---- deployment routes and headers ------------------------------------
+
+def test_robots_points_at_the_sitemap_and_excludes_the_api(client):
+    body = client.get('/robots.txt').get_data(as_text=True)
+    assert f'Sitemap: {server.SITE_URL}/sitemap.xml' in body
+    # Crawling these costs the solver work and yields nothing indexable.
+    for path in ('/run', '/frames', '/study'):
+        assert f'Disallow: {path}' in body
+
+
+def test_sitemap_lists_the_root_with_an_absolute_url(client):
+    res = client.get('/sitemap.xml')
+    assert res.mimetype == 'application/xml'
+    assert f'<loc>{server.SITE_URL}/</loc>' in res.get_data(as_text=True)
+
+
+def test_unknown_page_gets_the_styled_404(client):
+    res = client.get('/no-such-page')
+    assert res.status_code == 404
+    body = res.get_data(as_text=True)
+    assert 'That page does not exist' in body
+    assert 'href="/"' in body          # a way back to the simulator
+
+
+def test_unknown_api_path_gets_a_json_404(client):
+    # A JSON client should not have to parse an HTML page to see what failed.
+    res = client.get('/run/nope')
+    assert res.status_code == 404
+    assert res.get_json()['status'] == 'error'
+
+
+def test_security_headers_are_set(client):
+    h = client.get('/').headers
+    assert h['X-Content-Type-Options'] == 'nosniff'
+    assert h['X-Frame-Options'] == 'SAMEORIGIN'
+    # The favicon is an inline SVG data: URI, so img-src has to allow it.
+    assert "img-src 'self' data:" in h['Content-Security-Policy']
+
+
+def test_analytics_is_off_and_csp_stays_closed_by_default(client):
+    # No ANALYTICS_SITE means no third-party script and no widened CSP -
+    # local dev and these suites must never phone home.
+    res = client.get('/')
+    assert 'goatcounter' not in res.get_data(as_text=True)
+    csp = res.headers['Content-Security-Policy']
+    assert "script-src 'self'" in csp
+    assert 'gc.zgo.at' not in csp and 'goatcounter' not in csp
+
+
+def test_legal_pages_are_served_and_linked(client):
+    for path in ('/privacy.html', '/terms.html'):
+        assert client.get(path).status_code == 200
+    body = client.get('/').get_data(as_text=True)
+    assert 'href="/privacy.html"' in body and 'href="/terms.html"' in body
+
+
+def test_sitemap_lists_the_legal_pages(client):
+    xml = client.get('/sitemap.xml').get_data(as_text=True)
+    for path in ('/privacy.html', '/terms.html'):
+        assert f'<loc>{server.SITE_URL}{path}</loc>' in xml
+
+
+def test_https_is_not_forced_outside_production(client):
+    # Local dev and the test suites talk plain http; forcing a redirect here
+    # would break both.
+    assert server.IS_PROD is False
+    assert client.get('/').status_code == 200
+
+
+# ---- rate limiting ----------------------------------------------------
+
+def test_run_is_rate_limited_and_answers_with_json(client, monkeypatch):
+    monkeypatch.setattr(server, 'RUN_RATE_LIMIT', '2 per minute')
+    monkeypatch.setattr(server.limiter, 'enabled', True)
+    server.limiter.reset()
+    monkeypatch.setattr(server.subprocess, 'run', fake_run([]))
+
+    assert client.post('/run', json={}).status_code == 200
+    assert client.post('/run', json={}).status_code == 200
+
+    res = client.post('/run', json={})
+    assert res.status_code == 429
+    # A JSON caller should not get Flask's HTML error page back.
+    assert res.content_type.startswith('application/json')
+    assert res.get_json()['status'] == 'error'
+    assert 'Rate limit exceeded' in res.get_json()['message']
+    server.limiter.reset()
+
+
+def test_reading_frames_is_not_rate_limited(client, monkeypatch):
+    # Scrubbing the timeline fires these constantly; only /run spawns a solver.
+    monkeypatch.setattr(server, 'RUN_RATE_LIMIT', '1 per minute')
+    monkeypatch.setattr(server.limiter, 'enabled', True)
+    server.limiter.reset()
+
+    for _ in range(5):
+        assert client.get(f'/frames?run_id={RUN_ID}').status_code == 200
+    server.limiter.reset()
+
+
 # ---- POST /run argv construction --------------------------------------
 
 def test_post_run_flips_heat_sources_into_row_col(client, monkeypatch):
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
-    write_heatmap()
 
     client.post('/run', json={
         'rows': 10, 'cols': 10, 'mode': 'fdm',
@@ -188,16 +380,15 @@ def test_post_run_flips_heat_sources_into_row_col(client, monkeypatch):
     })
 
     cmd = calls[0]
-    assert cmd[7] == 'fdm'
+    assert positional(cmd)[7] == 'fdm'
     # y counts up from the bottom, so row = (rows - 1) - y.
-    assert cmd[10:13] == ['7', '3', '500.0']
+    assert positional(cmd)[10:13] == ['7', '3', '500.0']
     assert '--insulate=tl' in cmd
 
 
 def test_post_run_clamps_an_out_of_range_source(client, monkeypatch):
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
-    write_heatmap()
 
     client.post('/run', json={
         'rows': 10, 'cols': 10, 'mode': 'fdm',
@@ -205,13 +396,12 @@ def test_post_run_clamps_an_out_of_range_source(client, monkeypatch):
     })
 
     # Clamped to the last column and the top row, not dropped.
-    assert calls[0][10:13] == ['0', '9', '50.0']
+    assert positional(calls[0])[10:13] == ['0', '9', '50.0']
 
 
 def test_post_run_builds_fisher_arguments(client, monkeypatch):
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
-    write_heatmap()
 
     client.post('/run', json={
         'rows': 20, 'cols': 20, 'mode': 'fisher',
@@ -221,51 +411,146 @@ def test_post_run_builds_fisher_arguments(client, monkeypatch):
     })
 
     cmd = calls[0]
-    assert cmd[7] == 'fisher'
-    assert cmd[10:] == ['0.3', '2.0', '123']
+    assert positional(cmd)[7] == 'fisher'
+    assert positional(cmd)[10:] == ['0.3', '2.0', '123']
     assert not any(arg.startswith('--insulate=') for arg in cmd)
+
+
+def test_post_run_builds_schrodinger_arguments(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    client.post('/run', json={
+        'rows': 20, 'cols': 20, 'mode': 'schrodinger',
+        'potential': 'harmonic', 'schrodingerSteps': 321,
+        # The edges are hard walls holding psi = 0, so boundary temperatures
+        # and heat sources do not apply here any more than they do to wave.
+        'top': 100, 'hasPointSource': True,
+        'sources': [{'x': 1, 'y': 1, 'temp': 100}],
+    })
+
+    cmd = calls[0]
+    assert positional(cmd)[7] == 'schrodinger'
+    assert positional(cmd)[10:] == ['harmonic', '321']
+    assert not any(arg.startswith('--insulate=') for arg in cmd)
+
+
+@pytest.mark.parametrize('sent', ['coulomb', '', 'harmonic; rm -rf /', '../free', 42])
+def test_post_run_rejects_an_unknown_potential(client, monkeypatch, sent):
+    # The potential is a word that ends up in argv, so an unrecognised one is
+    # refused rather than passed through. The binary whitelists it too, but
+    # this is the layer that faces the network.
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    res = client.post('/run', json={'mode': 'schrodinger', 'potential': sent})
+
+    assert res.status_code == 400
+    assert res.get_json()['status'] == 'error'
+    # Nothing was run: the rejection happens before the solver is invoked.
+    assert calls == []
+
+
+def test_post_run_rejects_a_potential_without_running_a_different_one(client, monkeypatch):
+    # The specific regression: substituting 'free' here returned success and a
+    # free-particle run to a caller that asked for a harmonic one.
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    res = client.post('/run', json={'mode': 'schrodinger', 'potential': 'coulomb'})
+
+    assert 'coulomb' in res.get_json()['message']
+    assert calls == []
+
+
+def test_post_run_clamps_schrodinger_steps(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    client.post('/run', json={'mode': 'schrodinger', 'schrodingerSteps': 10 ** 9})
+    assert positional(calls[0])[11] == '200000'
+
+    client.post('/run', json={'mode': 'schrodinger', 'schrodingerSteps': 0})
+    assert positional(calls[1])[11] == '1'
 
 
 def test_post_run_builds_gray_scott_arguments(client, monkeypatch):
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
-    write_heatmap()
 
     client.post('/run', json={
         'rows': 128, 'cols': 128, 'mode': 'gray-scott',
         'Du': 0.16, 'Dv': 0.08, 'feed': 0.035, 'kill': 0.065, 'rdSteps': 900,
     })
 
-    assert calls[0][10:] == ['0.16', '0.08', '0.035', '0.065', '900']
+    assert positional(calls[0])[10:] == ['0.16', '0.08', '0.035', '0.065', '900']
 
 
 def test_post_run_pins_the_explicit_scheme_to_a_stable_diffusion_number(client, monkeypatch):
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
-    write_heatmap()
 
     # F is a free parameter for the implicit schemes only; the explicit one
     # diverges above 0.25, so whatever the client asks for is ignored.
     client.post('/run', json={'mode': 'fdm', 'F': 500})
-    assert calls[0][9] == '0.2'
+    assert positional(calls[0])[9] == '0.2'
 
     client.post('/run', json={'mode': 'cn', 'F': 500})
-    assert calls[1][9] == '500.0'
+    assert positional(calls[1])[9] == '500.0'
 
 
 def test_post_run_rejects_an_unknown_mode(client, monkeypatch):
+    # Falling back to fdm here meant a client asking for a mode this server
+    # does not have got a heat run labelled success - which is exactly how a
+    # stale deploy passed for a working one.
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
-    write_heatmap()
 
-    client.post('/run', json={'mode': 'nonsense'})
-    assert calls[0][7] == 'fdm'
+    res = client.post('/run', json={'mode': 'nonsense'})
+
+    assert res.status_code == 400
+    body = res.get_json()
+    assert body['status'] == 'error'
+    assert 'nonsense' in body['message']
+    assert calls == []
+
+
+def test_post_run_error_lists_the_modes_it_does_accept(client, monkeypatch):
+    monkeypatch.setattr(server.subprocess, 'run', fake_run([]))
+
+    message = client.post('/run', json={'mode': 'nope'}).get_json()['message']
+
+    # The list is what tells a caller whether the server is simply older than
+    # the mode they asked for.
+    for mode in ('fdm', 'wave', 'schrodinger'):
+        assert mode in message
+
+
+def test_post_run_does_not_echo_an_unbounded_mode(client, monkeypatch):
+    # The value is reflected back, so it arrives from the network capped.
+    monkeypatch.setattr(server.subprocess, 'run', fake_run([]))
+
+    res = client.post('/run', json={'mode': 'x' * 5000})
+
+    assert res.status_code == 400
+    assert len(res.get_json()['message']) < 200
+
+
+def test_post_run_still_accepts_the_explicit_alias(client, monkeypatch):
+    # 'explicit' maps to fdm. Now that unknown modes are refused, losing the
+    # alias would turn an older client's payload into a 400.
+    calls = []
+    monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
+
+    res = client.post('/run', json={'mode': 'explicit'})
+
+    assert res.status_code == 200
+    assert positional(calls[0])[7] == 'fdm'
 
 
 def test_post_run_accepts_the_legacy_single_source_payload(client, monkeypatch):
     calls = []
     monkeypatch.setattr(server.subprocess, 'run', fake_run(calls))
-    write_heatmap()
 
     # Older clients sent psR/psC/psTemp in row/col terms instead of sources[].
     client.post('/run', json={
@@ -273,4 +558,4 @@ def test_post_run_accepts_the_legacy_single_source_payload(client, monkeypatch):
         'hasPointSource': True, 'psR': 2, 'psC': 3, 'psTemp': 250,
     })
 
-    assert calls[0][10:13] == ['2', '3', '250.0']
+    assert positional(calls[0])[10:13] == ['2', '3', '250.0']

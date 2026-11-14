@@ -2,7 +2,7 @@
 // status. Grids and step counts are kept small purely for test speed; the
 // physics themselves are already covered by ../../../tests.cpp.
 const { test, expect } = require('@playwright/test');
-const { runSimulation } = require('./helpers');
+const { runSimulation, fetchFrameSteps } = require('./helpers');
 
 const MODES = [
   { mode: 'fdm', label: 'Explicit (forward Euler)' },
@@ -11,6 +11,13 @@ const MODES = [
   { mode: 'pde', label: 'Analytical steady state' },
   { mode: 'fisher', label: 'Fisher-KPP', rdSteps: 300 },
   { mode: 'gray-scott', label: 'Gray-Scott', rdSteps: 300 },
+  { mode: 'wave', label: 'Wave (leapfrog)', waveSteps: 200 },
+  { mode: 'schrodinger', label: 'Schrodinger, free particle',
+    schrodingerSteps: 200, potential: 'free' },
+  { mode: 'schrodinger', label: 'Schrodinger, square well',
+    schrodingerSteps: 200, potential: 'well' },
+  { mode: 'schrodinger', label: 'Schrodinger, harmonic oscillator',
+    schrodingerSteps: 200, potential: 'harmonic' },
 ];
 
 for (const m of MODES) {
@@ -21,10 +28,33 @@ for (const m of MODES) {
       rows: 20,
       cols: 20,
       rdSteps: m.rdSteps,
+      waveSteps: m.waveSteps,
+      schrodingerSteps: m.schrodingerSteps,
+      potential: m.potential,
     });
 
     expect(isError, `status was: ${statusText}`).toBe(false);
     expect(statusText).not.toMatch(/^Error:/);
     expect(body.status).toBe('success');
+    // Every run owns its files; the id is how the timeline finds them again.
+    expect(body.run_id).toMatch(/^[0-9a-f]{32}$/);
   });
 }
+
+test('two runs get different ids and separate frame lists', async ({ page }) => {
+  await page.goto('/');
+
+  const first = await runSimulation(page, { mode: 'fdm', rows: 20, cols: 20 });
+  const firstSteps = await fetchFrameSteps(page, first.body.run_id);
+
+  const second = await runSimulation(page, { mode: 'cn', rows: 12, cols: 12, F: 5 });
+  const secondSteps = await fetchFrameSteps(page, second.body.run_id);
+
+  expect(second.body.run_id).not.toBe(first.body.run_id);
+  expect(firstSteps.length).toBeGreaterThan(0);
+  expect(secondSteps.length).toBeGreaterThan(0);
+
+  // The first run's frames survive the second: before per-run files, starting
+  // a run wiped the previous one's database outright.
+  expect(await fetchFrameSteps(page, first.body.run_id)).toEqual(firstSteps);
+});

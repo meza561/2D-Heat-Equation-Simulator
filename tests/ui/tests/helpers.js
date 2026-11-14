@@ -89,6 +89,14 @@ async function runSimulation(page, opts = {}) {
   const isRD = o.mode === 'fisher' || o.mode === 'gray-scott';
   const isPde = o.mode === 'pde';
   const isImplicit = o.mode === 'be' || o.mode === 'cn';
+  // Wave hides the same panels RD does - it has no diffusivity, no sources and
+  // no boundary temperatures (its edges are clamped or free, not held at a
+  // value) - so filling those inputs would wait forever on a hidden field.
+  const isWave = o.mode === 'wave';
+  // Schrodinger hides the same panels for the same reason: no diffusivity, no
+  // sources, and hard walls instead of boundary temperatures.
+  const isSchrodinger = o.mode === 'schrodinger';
+  const noHeatInputs = isRD || isWave || isSchrodinger;
 
   await page.selectOption('#simMode', o.mode);
   await page.fill('#rows', String(o.rows));
@@ -97,14 +105,14 @@ async function runSimulation(page, opts = {}) {
   // alpha-params/mat-group/ps-group are hidden for pde and RD alike (the
   // analytical solver has no diffusivity, materials or sources); boundary
   // temperatures and insulated edges stay visible for pde, just not RD.
-  if (!isRD) {
+  if (!noHeatInputs) {
     await page.fill('#top', String(o.top));
     await page.fill('#bottom', String(o.bottom));
     await page.fill('#left', String(o.left));
     await page.fill('#right', String(o.right));
     await setInsulated(page, o.insulated);
   }
-  if (!isRD && !isPde) {
+  if (!noHeatInputs && !isPde) {
     await page.fill('#alpha', String(o.alpha));
     await setMaterials(page, o.materials);
     await setSources(page, o.sources);
@@ -114,6 +122,17 @@ async function runSimulation(page, opts = {}) {
   }
   if (isRD && o.rdSteps !== undefined) {
     await page.fill('#rdSteps', String(o.rdSteps));
+  }
+  if (isWave) {
+    if (o.waveSteps !== undefined) await page.fill('#waveSteps', String(o.waveSteps));
+    if (o.waveC !== undefined) await page.fill('#waveC', String(o.waveC));
+    if (o.waveBoundary !== undefined) await page.selectOption('#waveBoundary', o.waveBoundary);
+  }
+  if (isSchrodinger) {
+    if (o.schrodingerSteps !== undefined) {
+      await page.fill('#schrodingerSteps', String(o.schrodingerSteps));
+    }
+    if (o.potential !== undefined) await page.selectOption('#potential', o.potential);
   }
   if (o.mode === 'fisher') {
     if (o.rdD !== undefined) await page.fill('#fkD', String(o.rdD));
@@ -152,14 +171,14 @@ function parseLeadingNumber(text) {
   return m ? Number(m[0]) : NaN;
 }
 
-async function fetchFrame(page, step) {
-  const res = await page.request.get(`/run?time=${step}`);
+async function fetchFrame(page, step, runId) {
+  const res = await page.request.get(`/run?time=${step}&run_id=${runId}`);
   expect(res.ok()).toBeTruthy();
   return res.json();
 }
 
-async function fetchFrameSteps(page) {
-  const res = await page.request.get('/frames');
+async function fetchFrameSteps(page, runId) {
+  const res = await page.request.get(`/frames?run_id=${runId}`);
   expect(res.ok()).toBeTruthy();
   const body = await res.json();
   return body.steps;

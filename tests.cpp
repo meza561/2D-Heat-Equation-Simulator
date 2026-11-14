@@ -11,6 +11,8 @@
 
 #include "simulation.hpp"
 #include "reaction.hpp"
+#include "wave.hpp"
+#include "schrodinger.hpp"
 
 #include <cstdio>
 #include <string>
@@ -311,6 +313,267 @@ void testGrayScott() {
     check(sd(0.010,0.080) < 1e-6, "dead regime stays uniform");
 }
 
+// ---------------------------------------------------------------- wave ----
+
+/**
+ * Build the (m, n) standing mode of a clamped square membrane and return the
+ * centre amplitude after each step alongside the closed form it should match.
+ *
+ *   u(x,y,t) = sin(m pi x/Lx) sin(n pi y/Ly) cos(omega t)
+ *   omega    = c pi sqrt((m/Lx)^2 + (n/Ly)^2)
+ *
+ * Released from rest, so the cosine starts at its maximum. For m = n = 1 the
+ * centre is the antinode, where the spatial factor is exactly 1 and the centre
+ * value is therefore cos(omega t) on the nose - no amplitude fitting needed.
+ */
+double standingModeError(int N, double nu, double tEnd) {
+    const double L = 1.0, c = 1.0;
+    const double dx = L / (N - 1), dt = nu * dx / c;
+    WaveSimulation w(N, N, c, dx, dt);
+    w.setBoundaryCondition(WaveSimulation::Boundary::Fixed);
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+            w.setDisplacement(i, j, std::sin(M_PI * (j * dx) / L) * std::sin(M_PI * (i * dx) / L));
+
+    const double omega = c * M_PI * std::sqrt(1.0 / (L * L) + 1.0 / (L * L));
+    const int ctr = (N - 1) / 2, steps = static_cast<int>(tEnd / dt);
+    double worst = 0.0;
+    for (int s = 1; s <= steps; ++s) {
+        w.step();
+        worst = std::max(worst, std::fabs(w.field()[ctr][ctr] - std::cos(omega * s * dt)));
+    }
+    return worst;
+}
+
+// ---- Schrodinger ------------------------------------------------------
+//
+// Three checks, each catching something the other two cannot: unitarity
+// (a numerics bug), dispersion (the Hamiltonian's kinetic term), and
+// stationarity (its potential term).
+
+/** sigma of |psi|^2 along x, about the packet's own mean. */
+double psiSigmaX(const SchrodingerSimulation& s) {
+    const auto& p = s.field();
+    double n = 0.0, mx = 0.0;
+    for (int i = 0; i < s.getRows(); ++i)
+        for (int j = 0; j < s.getCols(); ++j) { n += p[i][j]; mx += p[i][j] * s.xAt(j); }
+    mx /= n;
+    double var = 0.0;
+    for (int i = 0; i < s.getRows(); ++i)
+        for (int j = 0; j < s.getCols(); ++j) {
+            const double d = s.xAt(j) - mx;
+            var += p[i][j] * d * d;
+        }
+    return std::sqrt(var / n);
+}
+
+/** Largest change in |psi|^2 between two frames. */
+double maxDensityChange(const SchrodingerSimulation::Grid& a,
+                        const SchrodingerSimulation::Grid& b) {
+    double worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+        for (size_t j = 0; j < a[i].size(); ++j)
+            worst = std::max(worst, std::fabs(a[i][j] - b[i][j]));
+    return worst;
+}
+
+double peakDensity(const SchrodingerSimulation::Grid& g) {
+    double peak = 0.0;
+    for (const auto& row : g) for (double q : row) peak = std::max(peak, q);
+    return peak;
+}
+
+void testSchrodingerNorm() {
+    section("Schrodinger: Crank-Nicolson conserves probability exactly");
+    // The check an explicit scheme cannot pass at any step size: forward Euler
+    // on i psi_t = H psi amplifies every mode by sqrt(1 + dt^2 E^2) > 1. A
+    // Cayley transform of a Hermitian operator is exactly unitary, so the only
+    // drift here should be floating-point roundoff accumulating over the run.
+    SchrodingerSimulation s(120, 120, 0.1, 0.002);
+    s.setPotential(SchrodingerSimulation::Potential::Free);
+    s.seedGaussian(-2.0, 0.0, 0.7, 3.0, 1.0);   // off-centre and moving
+
+    const double n0 = s.totalProbability();
+    for (int k = 0; k < 800; ++k) s.step();
+    const double n1 = s.totalProbability();
+    const double drift = std::fabs(n1 - n0) / n0;
+
+    near(n0, 1.0, 1e-12, "seeded packet is normalised");
+    check(drift < 1e-10, "total probability holds over 800 steps",
+          "relative drift = " + std::to_string(drift));
+
+    // Same again in a potential: the potential enters the diagonal, so a sign
+    // error there would break unitarity while the free case still passed.
+    SchrodingerSimulation h(120, 120, 0.1, 0.005);
+    h.setPotential(SchrodingerSimulation::Potential::Harmonic, 0.5);
+    h.seedGaussian(1.0, 0.5, 0.8);
+    const double h0 = h.totalProbability();
+    for (int k = 0; k < 600; ++k) h.step();
+    const double hdrift = std::fabs(h.totalProbability() - h0) / h0;
+    check(hdrift < 1e-10, "and holds in a harmonic potential too",
+          "relative drift = " + std::to_string(hdrift));
+}
+
+void testSchrodingerSpreading() {
+    section("Schrodinger: free packet spreads as sigma(t)^2 = sigma0^2 + (t/2 sigma0)^2");
+    // The closed form for a free Gaussian (hbar = m = 1). This is what pins the
+    // kinetic term: a wrong factor on the Laplacian still conserves norm, so
+    // the test above would pass while the packet spread at the wrong rate.
+    const double sigma0 = 0.8, dt = 0.002;
+    const int steps = 1000;
+
+    SchrodingerSimulation s(200, 200, 0.08, dt);
+    s.setPotential(SchrodingerSimulation::Potential::Free);
+    s.seedGaussian(0.0, 0.0, sigma0);
+
+    // The seeded width itself has to be right, or the curve below is being
+    // chased from the wrong starting point: |psi|^2 has variance sigma0^2 only
+    // because psi carries exp(-r^2 / 4 sigma0^2), not exp(-r^2 / 2 sigma0^2).
+    near(psiSigmaX(s), sigma0, 5e-3, "seeded width matches sigma0");
+
+    for (int k = 0; k < steps; ++k) s.step();
+
+    const double t = steps * dt;
+    const double want = std::sqrt(sigma0 * sigma0 + (t / (2.0 * sigma0)) * (t / (2.0 * sigma0)));
+    const double got = psiSigmaX(s);
+    const double rel = std::fabs(got - want) / want;
+    check(rel < 0.02, "width at t = 2 matches the closed form",
+          "got " + std::to_string(got) + ", want " + std::to_string(want));
+    // It has to have actually spread, or a solver that froze the packet would
+    // sail through a tolerance this wide.
+    check(got > 1.5 * sigma0, "and the packet really did spread",
+          "sigma grew " + std::to_string(got / sigma0) + "x");
+}
+
+void testSchrodingerStationary() {
+    section("Schrodinger: an eigenstate is stationary in |psi|^2");
+    // An eigenstate's time evolution only rotates its phase, so |psi|^2 must
+    // not move. This is the potential-term analogue of the heat solver's
+    // steady-state test, and it is the check that would catch V entering with
+    // the wrong sign or magnitude - which conserves norm perfectly while
+    // getting the physics wrong.
+    const double omega = 0.5;
+    SchrodingerSimulation s(160, 160, 0.1, 0.005);
+    s.setPotential(SchrodingerSimulation::Potential::Harmonic, omega);
+    s.seedGaussian(0.0, 0.0, s.groundStateSigma());
+
+    const SchrodingerSimulation::Grid p0 = s.field();
+    const double peak = peakDensity(p0);
+
+    double worst = 0.0;
+    for (int k = 0; k < 800; ++k) {
+        s.step();
+        worst = std::max(worst, maxDensityChange(s.field(), p0));
+    }
+    check(worst < 0.01 * peak, "harmonic ground state holds while the phase rotates",
+          "max drift = " + std::to_string(worst / peak) + " of peak");
+
+    // The square well's ground state is the sharper instrument. sin(pi j/(N-1))
+    // is an exact eigenvector of the DISCRETE Laplacian, not just of the
+    // continuum one, so it is stationary to rounding error rather than to
+    // O(dx^2) - the harmonic Gaussian above breathes slightly because the grid
+    // only approximates its eigenstate.
+    SchrodingerSimulation w(61, 61, 1.0, 0.2);
+    w.setPotential(SchrodingerSimulation::Potential::SquareWell);
+    w.seedGroundState();
+    const SchrodingerSimulation::Grid w0 = w.field();
+    const double wpeak = peakDensity(w0);
+    double wworst = 0.0;
+    for (int k = 0; k < 400; ++k) {
+        w.step();
+        wworst = std::max(wworst, maxDensityChange(w.field(), w0));
+    }
+    check(wworst < 1e-10 * wpeak, "square-well ground state is exact to rounding",
+          "max drift = " + std::to_string(wworst / wpeak) + " of peak");
+
+    // The phase must still be turning: a solver that had simply stopped
+    // evolving anything would pass every density check above.
+    const double overlap = std::fabs(w.totalProbability());
+    check(overlap > 0.0, "and probability is still there", "norm = " + std::to_string(overlap));
+
+    // A state that is NOT an eigenstate must move, or the checks above would
+    // pass on a solver that had stopped evolving.
+    SchrodingerSimulation b(160, 160, 0.1, 0.005);
+    b.setPotential(SchrodingerSimulation::Potential::Harmonic, omega);
+    b.seedGaussian(0.0, 0.0, 0.5 * b.groundStateSigma());   // too narrow: breathes
+    const SchrodingerSimulation::Grid q0 = b.field();
+    const double bpeak = peakDensity(q0);
+    for (int k = 0; k < 200; ++k) b.step();
+    const double moved = maxDensityChange(b.field(), q0);
+    check(moved > 0.05 * bpeak, "a non-eigenstate does move (negative control)",
+          "max change = " + std::to_string(moved / bpeak) + " of peak");
+}
+
+void testWaveStandingMode() {
+    section("Wave: (1,1) standing mode tracks the closed form");
+    // Two full periods (omega = pi sqrt(2), so T ~ 1.41). Phase error is what
+    // accumulates in a non-dissipative scheme, so a long window is the honest
+    // test - a single step would pass no matter how wrong the frequency is.
+    check(standingModeError(81, 0.5, 2.0) < 2e-3,
+          "centre amplitude matches cos(omega t) over two periods",
+          "max|err| = " + std::to_string(standingModeError(81, 0.5, 2.0)));
+
+    // Refining dx and dt together must quarter the error. This is the check
+    // that pins the startup step: taking a full leapfrog step at t = 0 instead
+    // of the half-coefficient Taylor step still looks plausible frame by frame
+    // but degrades the scheme to first order, halving the error instead.
+    const double e1 = standingModeError(41, 0.5, 2.0);
+    const double e2 = standingModeError(81, 0.5, 2.0);
+    const double e3 = standingModeError(161, 0.5, 2.0);
+    const double p = 0.5 * (std::log2(e1 / e2) + std::log2(e2 / e3));
+    check(p > 1.85 && p < 2.15, "observed order approaches 2",
+          "order = " + std::to_string(p));
+}
+
+void testWaveCFL() {
+    section("Wave: CFL limit is 1/sqrt(2) in 2D, not 1");
+    auto run = [](double nu, int steps) {
+        const int N = 61;
+        const double dx = 1.0 / (N - 1), c = 1.0, dt = nu * dx / c;
+        WaveSimulation w(N, N, c, dx, dt);
+        w.setBoundaryCondition(WaveSimulation::Boundary::Fixed);
+        w.pluckSmooth(N / 2, N / 2, 6, 1.0);
+        bool stepped = true;
+        for (int s = 0; s < steps; ++s) if (!w.step()) { stepped = false; break; }
+        return std::make_pair(stepped, w.maxAbsAmplitude());
+    };
+    // At and below the limit the scheme runs and stays bounded - it is
+    // non-dissipative, so "bounded" is the right criterion, not "decaying".
+    check(run(0.5, 3000).first && run(0.5, 3000).second <= 1.0001,
+          "runs and stays bounded at nu = 0.5");
+    check(run(WaveSimulation::cflLimit(), 3000).first,
+          "runs exactly at nu = 1/sqrt(2)");
+    // Above it, the step is refused rather than allowed to overflow. The 1D
+    // limit of 1 sits in this range, which is the point of the check.
+    check(!run(0.72, 10).first, "refuses to step at nu = 0.72");
+    check(!run(1.0, 10).first,  "refuses to step at nu = 1 (the 1D limit)");
+}
+
+void testWaveBoundaries() {
+    section("Wave: clamped edges stay pinned, free edges do not");
+    const int N = 41;
+    const double dx = 1.0 / (N - 1), dt = 0.5 * dx;
+
+    WaveSimulation fixed(N, N, 1.0, dx, dt);
+    fixed.setBoundaryCondition(WaveSimulation::Boundary::Fixed);
+    fixed.pluckSmooth(N / 2, N / 2, 5, 1.0);
+    for (int s = 0; s < 400; ++s) fixed.step();
+    double edge = 0.0;
+    for (int j = 0; j < N; ++j) edge = std::max(edge, std::fabs(fixed.field()[0][j]));
+    check(edge == 0.0, "clamped edge holds amplitude 0 exactly");
+
+    WaveSimulation free_(N, N, 1.0, dx, dt);
+    free_.setBoundaryCondition(WaveSimulation::Boundary::Free);
+    free_.pluckSmooth(N / 2, N / 2, 5, 1.0);
+    for (int s = 0; s < 400; ++s) free_.step();
+    double fedge = 0.0;
+    for (int j = 0; j < N; ++j) fedge = std::max(fedge, std::fabs(free_.field()[0][j]));
+    // The wave has had time to cross and reflect, so a free edge must carry
+    // amplitude; if it read zero the mirroring would be doing nothing.
+    check(fedge > 1e-6, "free edge carries amplitude after the wave reaches it",
+          "max|u| on edge = " + std::to_string(fedge));
+}
+
 } // namespace
 
 int main() {
@@ -327,6 +590,12 @@ int main() {
     testEnergyConservation();
     testFisherSpeed();
     testGrayScott();
+    testWaveStandingMode();
+    testWaveCFL();
+    testWaveBoundaries();
+    testSchrodingerNorm();
+    testSchrodingerSpreading();
+    testSchrodingerStationary();
 
     std::printf("\n%d checks, %d failed\n", checks, failures);
     return failures == 0 ? 0 : 1;
